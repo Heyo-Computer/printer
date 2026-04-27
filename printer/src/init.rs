@@ -1,6 +1,8 @@
 use crate::cli::InitArgs;
+use crate::hooks::{Event, HookContext, HookSet};
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub fn init(args: InitArgs) -> Result<()> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("spec.md"));
@@ -10,20 +12,92 @@ pub fn init(args: InitArgs) -> Result<()> {
             path.display()
         );
     }
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent dir {}", parent.display()))?;
-    }
-    let body = template(&args.title);
-    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("[printer] wrote {}", path.display());
+    let project_root = std::env::current_dir()
+        .context("resolving current directory for project root")?;
+
+    let hooks = HookSet::load_installed().unwrap_or_default();
+    hooks.run_cli(
+        Event::BeforeInit,
+        &HookContext::new(Event::BeforeInit, project_root.clone()),
+    )?;
+
+    let result: Result<()> = (|| {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent dir {}", parent.display()))?;
+        }
+        let body = template(&args.title);
+        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("[printer] wrote {}", path.display());
+        bootstrap_printer_dir(&project_root)?;
+        bootstrap_codegraph_index(&project_root);
+        Ok(())
+    })();
+
+    let after_ctx = HookContext::new(Event::AfterInit, project_root.clone())
+        .with_exit_status(result.is_ok());
+    let _ = hooks.run_cli(Event::AfterInit, &after_ctx);
+
+    result?;
     eprintln!(
         "Edit the checklist, then run `printer run {}` to drive the work.",
         path.display()
     );
     Ok(())
+}
+
+/// Create the `.printer/` skeleton (`.printer/tasks/`) so `printer run` and
+/// `printer exec` find a writable store on first invocation.
+fn bootstrap_printer_dir(root: &Path) -> Result<()> {
+    let tasks_dir = root.join(".printer").join("tasks");
+    std::fs::create_dir_all(&tasks_dir)
+        .with_context(|| format!("creating {}", tasks_dir.display()))?;
+    eprintln!("[printer] prepared {}", tasks_dir.display());
+    Ok(())
+}
+
+/// Best-effort: shell out to `codegraph index` so search/snippet/outline are
+/// usable from the agent's first turn. If `codegraph` is not on PATH or the
+/// index fails, warn and continue — the spec is still usable without it.
+fn bootstrap_codegraph_index(root: &Path) {
+    let out = Command::new("codegraph")
+        .args(["--text", "index"])
+        .current_dir(root)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let summary = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if summary.is_empty() {
+                eprintln!("[printer] codegraph index built");
+            } else {
+                eprintln!("[printer] {summary}");
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!(
+                "[printer] codegraph index failed (exit {}): {}",
+                o.status.code().unwrap_or(-1),
+                stderr.trim()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "[printer] codegraph not on PATH; skipping initial index. \
+                 Install with `make install-codegraph` to enable code-graph search."
+            );
+        }
+        Err(e) => {
+            eprintln!("[printer] could not invoke codegraph: {e}");
+        }
+    }
 }
 
 fn template(title: &str) -> String {

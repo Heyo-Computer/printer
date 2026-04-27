@@ -1,10 +1,14 @@
 mod agent;
 mod cli;
+mod exec;
+mod hooks;
 mod init;
+mod plugins;
 mod prompts;
 mod review;
 mod run;
 mod session;
+mod skills;
 mod tasks;
 
 use clap::Parser;
@@ -17,7 +21,21 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Init(args) => init::init(args),
         cli::Command::Run(args) => run::run(args).await,
         cli::Command::Review(args) => review::review(args).await,
+        cli::Command::Exec(args) => exec::exec(args).await,
         cli::Command::Task(args) => tasks::dispatch(args),
+        cli::Command::AddPlugin(args) => plugins::add_plugin(args),
+        cli::Command::Plugins => plugins::list_installed(),
+        cli::Command::Hooks(args) => dispatch_hooks(args),
+        cli::Command::External(args) => plugins::exec_external(&args),
+    }
+}
+
+fn dispatch_hooks(args: cli::HooksArgs) -> anyhow::Result<()> {
+    match args.command {
+        cli::HooksCommand::List(a) => {
+            let set = hooks::HookSet::load_installed()?;
+            set.print_list(a.event.as_deref())
+        }
     }
 }
 

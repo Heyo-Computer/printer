@@ -6,5 +6,8 @@ target/
 # interrupted mid-rename
 **/*.md.tmp
 
+# codegraph index (not source of truth, rebuild with `codegraph index`)
+.codegraph/
+
 # OS / editor cruft
 .DS_Store

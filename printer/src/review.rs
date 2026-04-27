@@ -1,12 +1,16 @@
 use crate::agent::AgentInvocation;
 use crate::cli::ReviewArgs;
-use crate::prompts::review_prompt;
+use crate::hooks::{Event, HookContext, HookSet};
+use crate::prompts::review_prompt_with;
 use crate::session::Session;
+use crate::skills;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub async fn review(args: ReviewArgs) -> Result<()> {
+    let hooks = HookSet::load_installed().unwrap_or_default();
+
     let spec_abs = args
         .spec
         .canonicalize()
@@ -16,12 +20,35 @@ pub async fn review(args: ReviewArgs) -> Result<()> {
         None => None,
     };
     let cwd_ref = cwd.as_deref();
+    let cwd_for_hook = cwd.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let base = match args.base {
         Some(b) => b,
         None => detect_base(cwd_ref).unwrap_or_else(|| "HEAD~1".to_string()),
     };
     eprintln!("[printer] reviewing against base ref: {base}");
+
+    hooks.run_cli(
+        Event::BeforeReview,
+        &HookContext::new(Event::BeforeReview, cwd_for_hook.clone())
+            .with_spec(spec_abs.clone())
+            .with_base_ref(base.clone()),
+    )?;
+
+    let agent_contrib = hooks.agent_for(Event::BeforeReview);
+    let injected_block = agent_contrib.render_prompt_block();
+
+    let default_skills_root = cwd_ref
+        .map(|d| d.join(".claude").join("skills"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".claude/skills"));
+    // Merge user-supplied --skill paths with hook-contributed skill paths.
+    let mut all_skill_paths = args.skills.clone();
+    all_skill_paths.extend(agent_contrib.skills.iter().cloned());
+    let resolved_skills = skills::resolve(&all_skill_paths, Some(&default_skills_root))?;
+    if !resolved_skills.is_empty() {
+        let names: Vec<&str> = resolved_skills.iter().map(|s| s.name.as_str()).collect();
+        eprintln!("[printer] skills available to reviewer: {}", names.join(", "));
+    }
 
     let agent = AgentInvocation {
         kind: args.agent,
@@ -32,16 +59,37 @@ pub async fn review(args: ReviewArgs) -> Result<()> {
     let mut session = Session::new(agent).with_verbose(args.verbose);
 
     let spec_arg = spec_abs.to_string_lossy().into_owned();
-    let outcome = session.turn(&review_prompt(&spec_arg, &base)).await?;
-    let report = outcome.result_text.trim();
-    println!("{report}");
+    let result: Result<String> = async {
+        let outcome = session
+            .turn(&review_prompt_with(
+                &spec_arg,
+                &base,
+                &resolved_skills,
+                injected_block.as_deref(),
+            ))
+            .await?;
+        let report = outcome.result_text.trim().to_string();
+        println!("{report}");
 
-    if let Some(out) = args.out.as_deref() {
-        std::fs::write(out, format!("{report}\n"))
-            .with_context(|| format!("failed to write review report to {}", out.display()))?;
-        eprintln!("[printer] review written to {}", out.display());
+        if let Some(out) = args.out.as_deref() {
+            std::fs::write(out, format!("{report}\n"))
+                .with_context(|| format!("failed to write review report to {}", out.display()))?;
+            eprintln!("[printer] review written to {}", out.display());
+        }
+        Ok(report)
     }
-    Ok(())
+    .await;
+
+    let mut after_ctx = HookContext::new(Event::AfterReview, cwd_for_hook)
+        .with_spec(spec_abs.clone())
+        .with_base_ref(base)
+        .with_exit_status(result.is_ok());
+    if let Some(out) = args.out.as_deref() {
+        after_ctx = after_ctx.with_report_path(out.to_path_buf());
+    }
+    let _ = hooks.run_cli(Event::AfterReview, &after_ctx);
+
+    result.map(|_| ())
 }
 
 fn detect_base(cwd: Option<&Path>) -> Option<String> {

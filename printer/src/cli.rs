@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -16,9 +17,21 @@ pub enum Command {
     Run(RunArgs),
     /// Review the working tree against the original spec.
     Review(ReviewArgs),
+    /// Run-then-review in one shot, with crash-safe `--continue`.
+    Exec(ExecArgs),
     /// File-based task tracking (create / list / start / done / ...).
     #[command(subcommand_help_heading = "Task subcommands")]
     Task(crate::tasks::TaskArgs),
+    /// Install a plugin into ~/.printer/plugins/.
+    AddPlugin(crate::plugins::AddPluginArgs),
+    /// List installed plugins.
+    Plugins,
+    /// Inspect the lifecycle hooks installed plugins have registered.
+    #[command(subcommand_help_heading = "Hook subcommands")]
+    Hooks(HooksArgs),
+    /// Forward to an installed plugin: `printer <plugin> <args>...`.
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 #[derive(clap::Args, Debug)]
@@ -104,9 +117,92 @@ pub struct ReviewArgs {
     #[arg(long, default_value = "bypassPermissions")]
     pub permission_mode: String,
 
+    /// Make a skill available to the review agent. Accepts a path to a
+    /// `SKILL.md`, a single skill directory, or a parent directory of skill
+    /// directories (e.g. `.claude/skills/`). Repeatable. If omitted,
+    /// `.claude/skills/` in the agent cwd is auto-discovered.
+    #[arg(long = "skill", value_name = "PATH")]
+    pub skills: Vec<PathBuf>,
+
     /// Show a live spinner and periodic heartbeats during the review turn.
     #[arg(long, short, default_value_t = false)]
     pub verbose: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ExecArgs {
+    /// Path to the markdown spec / todo file. Optional with `--continue`
+    /// (the spec path is then read from `.printer/exec.json`).
+    pub spec: Option<PathBuf>,
+
+    /// Resume a previous `printer exec` from `.printer/exec.json` instead of
+    /// starting fresh. If the previous run finished cleanly, jumps to review.
+    /// If the previous review finished cleanly, exits without doing anything.
+    #[arg(long = "continue", default_value_t = false)]
+    pub r#continue: bool,
+
+    /// Which agent to drive.
+    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    pub agent: AgentKind,
+
+    /// Override the model (passed through to the agent).
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Working directory for the child agent process.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Permission mode passed to the child agent.
+    #[arg(long, default_value = "bypassPermissions")]
+    pub permission_mode: String,
+
+    /// Live spinner / heartbeats during long turns.
+    #[arg(long, short, default_value_t = false)]
+    pub verbose: bool,
+
+    // --- run-phase only ---
+    /// Hard cap on driver turns during the run phase (excluding bootstrap).
+    #[arg(long, default_value_t = 40)]
+    pub max_turns: u32,
+
+    /// Cumulative input tokens at which the run phase rotates the session.
+    #[arg(long, default_value_t = 150_000)]
+    pub compact_at: u64,
+
+    // --- review-phase only ---
+    /// Git ref to diff against during review. Defaults to detected base
+    /// (`main` → `master` → `HEAD~1`).
+    #[arg(long)]
+    pub base: Option<String>,
+
+    /// If set, also write the review report to this path.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Make a skill available to the review agent. Same semantics as
+    /// `printer review --skill`. Repeatable.
+    #[arg(long = "skill", value_name = "PATH")]
+    pub skills: Vec<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HooksArgs {
+    #[command(subcommand)]
+    pub command: HooksCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksCommand {
+    /// List every hook contributed by every installed plugin.
+    List(HooksListArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HooksListArgs {
+    /// Filter to a single event (e.g. `after_review`).
+    #[arg(long)]
+    pub event: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

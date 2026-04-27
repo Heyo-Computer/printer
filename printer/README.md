@@ -291,6 +291,124 @@ compare-and-swap, so two simultaneous updates to the same task last-writer-win.
 This is fine for the typical single-user case; if you need stronger
 guarantees, take an external lock (e.g. `flock`) around your updates.
 
+## Plugins
+
+`printer` is a plugin host: external CLIs that live in the same ecosystem
+can be installed once into a per-user data directory and then invoked as
+`printer <plugin-name> <args>`.
+
+State lives under `~/.printer/`:
+
+```
+~/.printer/
+  plugins/
+    <name>/
+      plugin.toml      # name, version, binary path, source, install timestamp
+      bin/<name>       # the installed binary
+      src/             # cached source tree (kept so updates can `git pull`)
+```
+
+### Installing
+
+A plugin can come from one of three places:
+
+```sh
+# 1. registered name → printer knows how to install it
+printer add-plugin heyvm
+
+# 2. a Rust crate from a git URL or a local path → cargo install
+printer add-plugin https://github.com/Heyo-Computer/heyvm-rs
+printer add-plugin path:/home/me/dev/heyvm
+
+# 3. an arbitrary install command (vendor's own curl|sh installer, etc.)
+printer add-plugin heyvm \
+  --install-cmd "curl -fsSL https://heyo.computer/heyvm/install.sh | sh" \
+  --binary '~/.local/bin/heyvm'
+
+# extras
+printer add-plugin heyvm --rev v0.3.0   # pin a git ref (cargo source only)
+printer add-plugin heyvm --force        # reinstall over an existing one
+```
+
+Resolution order: explicit `--install-cmd` → `path:` prefix → registry name
+→ git-URL heuristic. `printer add-plugin` refuses to clobber an installed
+plugin without `--force`.
+
+#### Cargo source (registry name, git URL, or `path:`)
+
+1. `git clone` (or `git checkout <rev>`) into `~/.printer/plugins/<name>/src`,
+   or use the local path directly.
+2. `cargo install --path <src> --root ~/.printer/plugins/<name>`, producing
+   `~/.printer/plugins/<name>/bin/<binary>`.
+3. Write `plugin.toml` with the resolved version and source.
+
+#### Shell installer (`--install-cmd` + `--binary`)
+
+For plugins that ship their own installer — `curl … | sh`, `brew install`,
+prebuilt-archive download scripts — printer just runs the command verbatim
+and trusts it to land the binary at the path you provide. `~` in `--binary`
+is expanded.
+
+1. `sh -c "<your install command>"`.
+2. Verify a regular file exists at `--binary`.
+3. Best-effort detect version with `<binary> --version`.
+4. Write `plugin.toml` recording the command and the resolved absolute
+   binary path.
+
+Use this when the plugin author already publishes an installer you trust;
+printer doesn't move or symlink the binary, so subsequent `add-plugin
+--force` re-runs the same command (idempotency is the installer's
+responsibility).
+
+### Listing
+
+```sh
+printer plugins
+```
+
+```
+NAME         VERSION  SOURCE
+heyvm        0.3.0    git https://github.com/Heyo-Computer/heyvm@a1b2c3d4
+fake-plugin  0.1.0    path /home/me/dev/fake-plugin
+```
+
+### Invoking
+
+Any subcommand `printer` doesn't recognize as built-in is forwarded to a
+matching plugin:
+
+```sh
+printer heyvm up        # exec's ~/.printer/plugins/heyvm/bin/heyvm with `up`
+```
+
+On Unix this is a real `execve` — the plugin replaces `printer` in the
+process tree, so signals and exit codes flow through cleanly.
+
+If no such plugin is installed, `printer` reports it and exits non-zero
+without falling through.
+
+### Bundled registry
+
+`printer` ships with a small list of well-known plugins so the bare name
+just works:
+
+| Name    | Installer                                                                | Purpose |
+| ---     | ---                                                                      | --- |
+| `heyvm` | shell — `curl -fsSL https://heyo.computer/heyvm/install.sh \| sh` → `~/.local/bin/heyvm` | Spin up agent VMs and dev-preview environments. |
+
+To add more known plugins, edit `printer/src/plugins/registry.rs`. Registry
+entries can be either `KnownInstaller::Cargo { git }` (clone-and-build) or
+`KnownInstaller::Shell { command, binary }` (vendor installer).
+
+### Limitations
+
+- Only single-binary crates are supported in v1; multi-bin crates need a
+  `--bin` flag (not implemented).
+- No `remove-plugin` / `update` yet — for now, blow away
+  `~/.printer/plugins/<name>/` and reinstall.
+- Plugin binaries are not added to your shell `PATH` automatically; invoke
+  them through `printer <name>`.
+
 ## Conventions used in prompts
 
 `printer` instructs the agent to emit these literal sentinels on their own
