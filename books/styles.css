@@ -1,0 +1,408 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #0f0f0f;
+  background-color: #f6f6f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body, html {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+button, input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+input, select, button, textarea {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 4px 8px;
+  background: #fff;
+}
+
+button {
+  cursor: pointer;
+  background: #fff;
+}
+
+button:hover:not(:disabled) {
+  border-color: #396cd8;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* Sidebar */
+.sidebar {
+  border-right: 1px solid #ddd;
+  padding: 12px;
+  overflow-y: auto;
+  background: #fafafa;
+  outline: none;
+}
+
+.sidebar h2 {
+  margin: 0 0 12px;
+  font-size: 1.1em;
+}
+
+.sidebar-books, .sidebar-primitives {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar-book {
+  margin-bottom: 4px;
+}
+
+.sidebar-book-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.sidebar-book-row:hover {
+  background: #eef;
+}
+
+.sidebar-book.active > .sidebar-book-row {
+  background: #d6e4ff;
+}
+
+.sidebar-toggle {
+  background: none;
+  border: none;
+  padding: 0 4px;
+  font-size: 0.8em;
+}
+
+.sidebar-book-name {
+  font-weight: 500;
+}
+
+.sidebar-primitives {
+  margin-left: 18px;
+}
+
+.sidebar-primitive {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95em;
+}
+
+.sidebar-primitive:hover {
+  background: #eef;
+}
+
+.sidebar-primitive.active {
+  background: #d6e4ff;
+}
+
+.prim-kind {
+  font-size: 0.75em;
+  text-transform: uppercase;
+  color: #888;
+  background: #eee;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.prim-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prim-delete {
+  border: none;
+  background: none;
+  color: #c33;
+  padding: 0 4px;
+}
+
+.sidebar-add-row {
+  margin-top: 4px;
+}
+
+.sidebar-add-prim {
+  background: none;
+  border: 1px dashed #aaa;
+  width: 100%;
+  font-size: 0.85em;
+  color: #666;
+}
+
+.add-prim-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.add-prim-form input {
+  flex: 1;
+  min-width: 80px;
+}
+
+/* Editor pane */
+.editor-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.editor-pane-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #888;
+  font-size: 1.1em;
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #ddd;
+  background: #fafafa;
+}
+
+.editor-toolbar .filename {
+  font-weight: 500;
+}
+
+.dirty-indicator {
+  font-size: 0.85em;
+  color: #888;
+}
+
+.error {
+  color: #c33;
+  padding: 4px 12px;
+  margin: 0;
+}
+
+/* Markdown editor */
+.markdown-editor, .csv-editor, .kanban {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+.editor-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  flex: 1;
+  overflow: hidden;
+}
+
+.editor-source {
+  border: none;
+  border-right: 1px solid #ddd;
+  padding: 12px;
+  resize: none;
+  font-family: monospace;
+  font-size: 13px;
+  outline: none;
+}
+
+.editor-preview {
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.editor-preview h1, .editor-preview h2, .editor-preview h3 {
+  margin-top: 0.5em;
+}
+
+.editor-preview pre {
+  background: #f0f0f0;
+  padding: 8px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.editor-preview code {
+  font-family: monospace;
+  background: #f0f0f0;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* CSV editor */
+.csv-table-wrap {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+}
+
+.csv-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.csv-table th, .csv-table td {
+  border: 1px solid #ddd;
+  padding: 0;
+}
+
+.csv-header, .csv-cell {
+  border: none;
+  width: 100%;
+  padding: 4px 6px;
+  background: transparent;
+}
+
+.csv-header {
+  font-weight: bold;
+  background: #f0f0f0;
+}
+
+.csv-remove {
+  border: none;
+  background: none;
+  color: #c33;
+  padding: 0 4px;
+}
+
+.csv-actions {
+  width: 32px;
+  text-align: center;
+}
+
+/* Kanban */
+.kanban-columns {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  overflow-x: auto;
+  flex: 1;
+}
+
+.kanban-column {
+  flex: 0 0 240px;
+  background: #f0f0f0;
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kanban-status {
+  margin: 0;
+  font-size: 0.95em;
+  text-transform: uppercase;
+  color: #555;
+}
+
+.kanban-card {
+  background: #fff;
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+  padding: 8px;
+}
+
+.kanban-card-title {
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.kanban-card-notes {
+  font-size: 0.9em;
+  color: #555;
+  white-space: pre-wrap;
+}
+
+.kanban-card-title-edit, .kanban-card-notes-edit {
+  width: 100%;
+  margin-bottom: 4px;
+}
+
+.kanban-card-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.kanban-card-actions button {
+  flex: 1;
+  padding: 2px 4px;
+  font-size: 0.85em;
+}
+
+.kanban-new {
+  flex: 1;
+}
+
+/* New book form */
+.new-book-form {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid #ddd;
+  background: #fafafa;
+  align-items: center;
+}
+
+.new-book-form h2 {
+  margin: 0 12px 0 0;
+  font-size: 1em;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f6f6f6;
+    background-color: #1f1f1f;
+  }
+  body, html { background: #1f1f1f; }
+  input, select, button, textarea {
+    background: #2a2a2a;
+    border-color: #444;
+    color: #f6f6f6;
+  }
+  .sidebar { background: #252525; border-right-color: #444; }
+  .editor-toolbar, .new-book-form { background: #252525; border-color: #444; }
+  .sidebar-book-row:hover, .sidebar-primitive:hover { background: #333; }
+  .sidebar-book.active > .sidebar-book-row, .sidebar-primitive.active { background: #2c3e60; }
+  .prim-kind { background: #333; color: #aaa; }
+  .csv-header { background: #2a2a2a; }
+  .editor-source { border-right-color: #444; }
+  .editor-preview pre, .editor-preview code { background: #2a2a2a; }
+  .kanban-column { background: #2a2a2a; }
+  .kanban-card { background: #333; }
+}

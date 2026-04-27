@@ -1,0 +1,10 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Atomic-write temp files left behind by `printer task` if a write was
+# interrupted mid-rename
+**/*.md.tmp
+
+# OS / editor cruft
+.DS_Store
