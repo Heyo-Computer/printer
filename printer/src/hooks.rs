@@ -430,7 +430,7 @@ fn interpolate(template: &str, ctx: &HookContext) -> String {
     out
 }
 
-fn resolve_hook(plugin: &str, plugin_dir: &Path, spec: HookSpec) -> Result<Hook> {
+pub(crate) fn resolve_hook(plugin: &str, plugin_dir: &Path, spec: HookSpec) -> Result<Hook> {
     let event = Event::parse(&spec.event)
         .ok_or_else(|| anyhow::anyhow!("unknown event `{}`", spec.event))?;
     match spec.kind {

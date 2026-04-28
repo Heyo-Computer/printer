@@ -1,3 +1,4 @@
+use crate::agent::TokenUsage;
 use crate::cli::{ExecArgs, ReviewArgs, RunArgs};
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::{review, run};
@@ -183,7 +184,7 @@ async fn run_action(
     existing: Option<Checkpoint>,
 ) -> Result<()> {
     let _ = cwd;
-    match action {
+    let total = match action {
         Action::AlreadyDone { spec } => {
             eprintln!(
                 "[printer] exec already complete for {} (checkpoint phase=done). \
@@ -196,34 +197,37 @@ async fn run_action(
         Action::Fresh { spec } => {
             let cp = Checkpoint::new(spec.clone(), Phase::Running);
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path).await?;
+            do_run_then_review(&args, &spec, &checkpoint_path).await?
         }
         Action::ResumeRun { spec } => {
             // Bump updated_at so the file reflects this resume.
             let mut cp = existing.unwrap();
             cp.updated_at = Utc::now();
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path).await?;
+            do_run_then_review(&args, &spec, &checkpoint_path).await?
         }
         Action::ResumeReview { spec } => {
             eprintln!("[printer] resuming at review phase for {}", spec.display());
-            do_review(&args, &spec, &checkpoint_path).await?;
+            do_review(&args, &spec, &checkpoint_path).await?
         }
-    }
+    };
 
+    eprintln!("[printer] exec token usage (run + review): {total}");
     Ok(())
 }
 
-async fn do_run_then_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<()> {
-    run::run(build_run_args(args, spec)).await?;
+async fn do_run_then_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<TokenUsage> {
+    let mut total = run::run(build_run_args(args, spec)).await?;
     write_phase(cp_path, spec, Phase::ReviewPending)?;
-    do_review(args, spec, cp_path).await
+    let review_total = do_review(args, spec, cp_path).await?;
+    total.add(&review_total);
+    Ok(total)
 }
 
-async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<()> {
-    review::review(build_review_args(args, spec)).await?;
+async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<TokenUsage> {
+    let usage = review::review(build_review_args(args, spec)).await?;
     write_phase(cp_path, spec, Phase::Done)?;
-    Ok(())
+    Ok(usage)
 }
 
 fn write_phase(cp_path: &Path, spec: &Path, phase: Phase) -> Result<()> {

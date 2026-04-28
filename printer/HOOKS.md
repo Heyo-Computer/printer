@@ -152,6 +152,60 @@ PRINTER_HOOK_REPORT_PATH=/abs/path/review.md     # if --out was set
 PRINTER_PLUGIN=my-plugin                          # which plugin owns this hook
 ```
 
+## Authoring a plugin
+
+A plugin's source crate may include an optional `printer-plugin.toml` at
+its root. When `printer add-plugin` installs the plugin, this file is read
+and its contents are merged into the installed `plugin.toml` and copied
+into the install directory. Without this file, plugins install with no
+hooks and no extra assets — the historical behaviour.
+
+```toml
+# plugins/<name>/printer-plugin.toml
+
+# Files or directories (relative paths only, no `..`) to copy verbatim
+# from the source root into the installed plugin dir alongside the
+# binary. Hook fields like `skill = "skills/foo/SKILL.md"` resolve
+# against the install dir, so anything they reference must be listed here.
+assets = ["skills"]
+
+# Hooks have the same schema as `[[hooks]]` in the installed manifest;
+# they are validated at install time and refused if malformed.
+
+[[hooks]]
+type = "cli"
+event = "before_run"
+command = "codegraph index"
+on_failure = "warn"
+
+[[hooks]]
+type = "agent"
+event = "before_run"
+skill = "skills/codegraph-search/SKILL.md"
+
+[[hooks]]
+type = "agent"
+event = "before_run"
+command = "Prefer `codegraph` over grep + Read for navigation."
+```
+
+Notes:
+
+- **Source dir requirement** — `printer-plugin.toml` is only read for
+  plugins installed via `path:` or a git URL (cargo crates with a real
+  source tree). Shell-installer plugins (`--install-cmd`) have no source
+  dir under printer's control, so they cannot ship hooks via this
+  mechanism; their hooks must be hand-edited into `plugin.toml`.
+- **`cargo install` discards non-binary files** — the only reason your
+  `skills/` directory survives the install is the `assets` list. Forget
+  to include it and the hook's `skill = "..."` paths will dangle.
+- **Validation is strict** — install fails if a hook references an
+  unknown event or violates the type/command/skill constraints. Fix the
+  source manifest and re-run with `--force`.
+- **Path safety** — assets must be relative paths without `..`
+  components. Symlinks inside an asset directory are refused. The install
+  refuses to clobber pre-existing files in the install dir.
+
 ## Listing what's wired up
 
 ```

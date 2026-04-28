@@ -1,5 +1,6 @@
 use super::cli::AddPluginArgs;
 use super::registry::{self, KnownInstaller};
+use super::source::{self, SourceManifest};
 use super::store::{self, Manifest, Source};
 use crate::tasks::model::now_iso;
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,15 +36,36 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         ResolvedKind::Shell { command, binary } => install_shell(&command, &binary)?,
     };
 
+    // Read optional `printer-plugin.toml` from the source dir, validate its
+    // hooks, and copy any declared asset files alongside the binary so paths
+    // referenced by hooks resolve at runtime.
+    let (declared_hooks, declared_assets) = match installed.source_dir.as_deref() {
+        Some(src) => {
+            let sm = SourceManifest::load(src)?;
+            let hooks = sm.validate_hooks(&name, &plugin_dir)?;
+            (hooks, sm.assets)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    if let Some(src) = installed.source_dir.as_deref()
+        && !declared_assets.is_empty()
+    {
+        source::copy_assets(src, &plugin_dir, &declared_assets)?;
+    }
+    let hook_count = declared_hooks.len();
+
     let manifest = Manifest {
         name: name.clone(),
         version: installed.version,
         binary: installed.binary,
         installed_at: now_iso(),
         source: installed.source,
-        hooks: Vec::new(),
+        hooks: declared_hooks,
     };
     store::write_manifest(&plugin_dir, &manifest)?;
+    if hook_count > 0 {
+        eprintln!("[printer] registered {hook_count} hook(s) for `{name}`");
+    }
 
     println!(
         "installed plugin `{name}` v{} -> {}",
@@ -59,6 +81,10 @@ struct Installed {
     binary: String,
     version: String,
     source: Source,
+    /// Absolute path to the plugin's source directory, if there is one
+    /// (cargo-git / cargo-path). Shell-installer plugins return `None`.
+    /// Used to look up an optional `printer-plugin.toml`.
+    source_dir: Option<PathBuf>,
 }
 
 fn install_cargo_git(plugin_dir: &Path, url: &str, rev: Option<&str>) -> Result<Installed> {
@@ -82,6 +108,7 @@ fn install_cargo_git(plugin_dir: &Path, url: &str, rev: Option<&str>) -> Result<
             url: url.to_string(),
             rev: head,
         },
+        source_dir: Some(src_dir),
     })
 }
 
@@ -96,6 +123,7 @@ fn install_cargo_path(plugin_dir: &Path, path: &Path) -> Result<Installed> {
         source: Source::Path {
             path: canon.to_string_lossy().into_owned(),
         },
+        source_dir: Some(canon),
     })
 }
 
@@ -169,6 +197,7 @@ fn install_shell(command: &str, binary: &str) -> Result<Installed> {
         source: Source::Shell {
             command: command.to_string(),
         },
+        source_dir: None,
     })
 }
 

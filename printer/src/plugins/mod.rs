@@ -2,6 +2,7 @@ pub mod cli;
 pub mod exec;
 pub mod install;
 pub mod registry;
+pub mod source;
 pub mod store;
 
 pub use cli::AddPluginArgs;

@@ -19,8 +19,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Command::Init(args) => init::init(args),
-        cli::Command::Run(args) => run::run(args).await,
-        cli::Command::Review(args) => review::review(args).await,
+        cli::Command::Run(args) => run::run(args).await.map(|_| ()),
+        cli::Command::Review(args) => review::review(args).await.map(|_| ()),
         cli::Command::Exec(args) => exec::exec(args).await,
         cli::Command::Task(args) => tasks::dispatch(args),
         cli::Command::AddPlugin(args) => plugins::add_plugin(args),

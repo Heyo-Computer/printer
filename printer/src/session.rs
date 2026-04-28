@@ -1,4 +1,4 @@
-use crate::agent::{AgentInvocation, TurnOutcome};
+use crate::agent::{AgentInvocation, TokenUsage, TurnOutcome};
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::process::Stdio;
@@ -11,7 +11,12 @@ use uuid::Uuid;
 pub struct Session<'a> {
     pub id: Uuid,
     pub turn_count: u32,
+    /// Largest single-turn input-side token total seen in the *current* (not
+    /// yet rotated) session. Used by the compaction trigger only.
     pub cumulative_input_tokens: u64,
+    /// Sum of every turn's token usage for the lifetime of this Session,
+    /// including across rotations. This is the operation-level total.
+    pub usage_total: TokenUsage,
     pub agent: AgentInvocation<'a>,
     pub verbose: bool,
     fresh: bool,
@@ -23,6 +28,7 @@ impl<'a> Session<'a> {
             id: Uuid::new_v4(),
             turn_count: 0,
             cumulative_input_tokens: 0,
+            usage_total: TokenUsage::default(),
             agent,
             verbose: false,
             fresh: true,
@@ -161,12 +167,15 @@ impl<'a> Session<'a> {
 
         let outcome = self.agent.parse_outcome(stdout_buf, &self.id)?;
         self.turn_count += 1;
-        self.cumulative_input_tokens = outcome.input_tokens.max(self.cumulative_input_tokens);
+        self.cumulative_input_tokens =
+            outcome.input_tokens().max(self.cumulative_input_tokens);
+        self.usage_total.add(&outcome.usage);
         eprintln!(
-            "[printer] turn {} done in {:.1}s ({} input tokens cumulative)",
+            "[printer] turn {} done in {:.1}s (turn: {}; op total: {})",
             self.turn_count,
             started.elapsed().as_secs_f32(),
-            self.cumulative_input_tokens
+            outcome.usage,
+            self.usage_total,
         );
         // Subsequent turns resume the same session id (claude requires a new
         // uuid for --session-id, so we keep using --resume from now on).

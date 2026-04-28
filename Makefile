@@ -18,6 +18,11 @@ CARGO_FLAGS ?= --release
 
 CRATES := printer computer codegraph
 
+# Plugins live under plugins/<name>/ and are installed via `printer add-plugin`
+# rather than landed on $(BINDIR) directly. `make install-plugins` is the
+# convenience wrapper for the bundled set; right now that's just `codegraph`.
+PLUGINS := codegraph
+
 .PHONY: all build install uninstall clean check test help \
 	$(addprefix build-,$(CRATES)) \
 	$(addprefix install-,$(CRATES))
@@ -80,4 +85,19 @@ test:
 clean:
 	@for c in $(CRATES); do \
 		$(CARGO) clean --manifest-path $$c/Cargo.toml; \
+	done
+
+# Install every bundled plugin via `printer add-plugin path:plugins/<name>`.
+# Requires `printer` to already be on $PATH (e.g. after `make install-printer`).
+install-plugins:
+	@for p in $(PLUGINS); do \
+		echo "==> printer add-plugin path:plugins/$$p --force"; \
+		printer add-plugin path:plugins/$$p --force; \
+	done
+
+uninstall-plugins:
+	@for p in $(PLUGINS); do \
+		dir="$$HOME/.printer/plugins/$$p"; \
+		if [ -d "$$dir" ]; then rm -rf "$$dir" && echo "removed $$dir"; \
+		else echo "$$dir not installed"; fi; \
 	done

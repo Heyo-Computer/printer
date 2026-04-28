@@ -1,14 +1,64 @@
 use crate::cli::AgentKind;
 use serde::Deserialize;
+use std::fmt;
 use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
+
+/// Per-turn token breakdown, normalized across agents.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Sum of all input-side tokens (new input + cache creation + cache read).
+    pub fn input_total(&self) -> u64 {
+        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+    }
+
+    /// Grand total: input-side + output.
+    pub fn grand_total(&self) -> u64 {
+        self.input_total() + self.output_tokens
+    }
+
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
+}
+
+impl fmt::Display for TokenUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} total (input: {} new + {} cache-write + {} cache-read; output: {})",
+            self.grand_total(),
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+            self.output_tokens,
+        )
+    }
+}
 
 /// Outcome of a single turn, normalized across agents.
 #[derive(Debug, Default, Clone)]
 pub struct TurnOutcome {
     pub result_text: String,
-    pub input_tokens: u64,
+    pub usage: TokenUsage,
+}
+
+impl TurnOutcome {
+    /// Convenience accessor for the input-side total used by compaction logic.
+    pub fn input_tokens(&self) -> u64 {
+        self.usage.input_total()
+    }
 }
 
 /// Parsed shape of `claude --print --output-format json`.
@@ -20,10 +70,12 @@ struct ClaudeJsonResult {
     usage: Option<ClaudeUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ClaudeUsage {
     #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
     #[serde(default)]
     cache_creation_input_tokens: u64,
     #[serde(default)]
@@ -107,23 +159,22 @@ impl<'a> AgentInvocation<'a> {
 fn parse_claude(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
     let parsed: ClaudeJsonResult = serde_json::from_str(stdout.trim())
         .map_err(|e| anyhow::anyhow!("failed to parse claude JSON output: {e}\n--- stdout ---\n{stdout}"))?;
-    let usage = parsed.usage.unwrap_or(ClaudeUsage {
-        input_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-    });
-    let input_tokens = usage.input_tokens
-        + usage.cache_creation_input_tokens
-        + usage.cache_read_input_tokens;
+    let raw = parsed.usage.unwrap_or_default();
+    let usage = TokenUsage {
+        input_tokens: raw.input_tokens,
+        output_tokens: raw.output_tokens,
+        cache_creation_input_tokens: raw.cache_creation_input_tokens,
+        cache_read_input_tokens: raw.cache_read_input_tokens,
+    };
     Ok(TurnOutcome {
         result_text: parsed.result,
-        input_tokens,
+        usage,
     })
 }
 
 fn parse_opencode(stdout: String, _fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
     Ok(TurnOutcome {
         result_text: stdout,
-        input_tokens: 0,
+        usage: TokenUsage::default(),
     })
 }

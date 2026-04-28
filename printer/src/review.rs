@@ -1,4 +1,4 @@
-use crate::agent::AgentInvocation;
+use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::ReviewArgs;
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::prompts::review_prompt_with;
@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub async fn review(args: ReviewArgs) -> Result<()> {
+pub async fn review(args: ReviewArgs) -> Result<TokenUsage> {
     let hooks = HookSet::load_installed().unwrap_or_default();
 
     let spec_abs = args
@@ -89,7 +89,11 @@ pub async fn review(args: ReviewArgs) -> Result<()> {
     }
     let _ = hooks.run_cli(Event::AfterReview, &after_ctx);
 
-    result.map(|_| ())
+    let usage = session.usage_total;
+    if result.is_ok() {
+        eprintln!("[printer] review token usage: {usage}");
+    }
+    result.map(|_| usage)
 }
 
 fn detect_base(cwd: Option<&Path>) -> Option<String> {

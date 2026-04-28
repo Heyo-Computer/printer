@@ -1,4 +1,4 @@
-use crate::agent::AgentInvocation;
+use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::RunArgs;
 use crate::hooks::{AgentContribution, Event, HookContext, HookSet};
 use crate::prompts::{
@@ -14,7 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
-pub async fn run(args: RunArgs) -> Result<()> {
+pub async fn run(args: RunArgs) -> Result<TokenUsage> {
     let hooks = HookSet::load_installed().unwrap_or_default();
     let spec_abs = args
         .spec
@@ -70,6 +70,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .with_exit_status(inner.is_ok());
     let _ = hooks.run_cli(Event::AfterRun, &after_ctx);
 
+    if let Ok(usage) = &inner {
+        eprintln!("[printer] run token usage: {usage}");
+    }
     inner
 }
 
@@ -88,7 +91,7 @@ async fn run_inner(
     tasks_dir: &std::path::Path,
     injected_block: Option<&str>,
     injected_skills: &[skills::Skill],
-) -> Result<()> {
+) -> Result<TokenUsage> {
     let printer_bin = std::env::current_exe()
         .context("resolving printer binary path for the agent prompt")?;
     let printer_bin_str = printer_bin.to_string_lossy().into_owned();
@@ -136,7 +139,7 @@ async fn run_inner(
 
     if all_done(&tasks) {
         eprintln!("[printer] all tasks already done; nothing to do.");
-        return Ok(());
+        return Ok(session.usage_total);
     }
 
     for _ in 0..args.max_turns {
@@ -158,7 +161,7 @@ async fn run_inner(
             prev_state_hash = state_hash(&tasks);
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
-                return Ok(());
+                return Ok(session.usage_total);
             }
             continue;
         }
@@ -180,7 +183,7 @@ async fn run_inner(
         if outcome.result_text.contains(SENTINEL_DONE) {
             if all_done(&tasks) {
                 eprintln!("[printer] all tasks done.");
-                return Ok(());
+                return Ok(session.usage_total);
             } else {
                 eprintln!(
                     "[printer] agent emitted {SENTINEL_DONE} but the task store still has unfinished work; nudging once more"
@@ -189,7 +192,7 @@ async fn run_inner(
         }
         if all_done(&tasks) {
             eprintln!("[printer] all tasks done.");
-            return Ok(());
+            return Ok(session.usage_total);
         }
 
         // Stall detection: did any task transition this turn?
