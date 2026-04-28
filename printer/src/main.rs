@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::Run(args) => run::run(args).await.map(|_| ()),
         cli::Command::Review(args) => review::review(args).await.map(|_| ()),
         cli::Command::Exec(args) => exec::exec(args).await,
+        cli::Command::History(args) => exec::print_history(args),
         cli::Command::Task(args) => tasks::dispatch(args),
         cli::Command::AddPlugin(args) => plugins::add_plugin(args),
         cli::Command::Plugins => plugins::list_installed(),

@@ -67,12 +67,18 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         eprintln!("[printer] registered {hook_count} hook(s) for `{name}`");
     }
 
-    println!(
-        "installed plugin `{name}` v{} -> {}",
-        manifest.version,
-        manifest.binary
-    );
-    println!("invoke with: printer {name} <args...>");
+    if manifest.binary.is_empty() {
+        println!(
+            "installed plugin `{name}` v{} (skill-only; contributes hooks/assets)",
+            manifest.version
+        );
+    } else {
+        println!(
+            "installed plugin `{name}` v{} -> {}",
+            manifest.version, manifest.binary
+        );
+        println!("invoke with: printer {name} <args...>");
+    }
     Ok(())
 }
 
@@ -116,7 +122,18 @@ fn install_cargo_path(plugin_dir: &Path, path: &Path) -> Result<Installed> {
     let canon = path
         .canonicalize()
         .with_context(|| format!("resolving local plugin path {}", path.display()))?;
-    let (binary, version) = cargo_install_to(&canon, plugin_dir)?;
+    let (binary, version) = if canon.join("Cargo.toml").is_file() {
+        cargo_install_to(&canon, plugin_dir)?
+    } else {
+        // Skill-only plugin: no binary to build, just hooks/assets. The
+        // dispatcher will refuse `printer <name>` invocations on it (see
+        // exec_external); contributed hooks/skills still flow through.
+        eprintln!(
+            "[printer] no Cargo.toml at {}; installing as skill-only plugin (no binary)",
+            canon.display()
+        );
+        (String::new(), "0.0.0".to_string())
+    };
     Ok(Installed {
         binary,
         version,

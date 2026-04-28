@@ -1,0 +1,15 @@
+# Hooks and assets the `computer` plugin contributes when installed.
+# Ships the `computer` skill (Wayland desktop automation for headless review
+# verification) and exposes it to the reviewer agent on every `printer review`
+# / `printer exec` run, so review can confirm UI behaviour visually
+# regardless of cwd.
+
+assets = ["skills"]
+
+# --- Review phase --------------------------------------------------------
+
+# Reviewer-only: implementation runs are not expected to drive the desktop.
+[[hooks]]
+type = "agent"
+event = "before_review"
+skill = "skills/computer/SKILL.md"
