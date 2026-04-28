@@ -1,6 +1,7 @@
-use crate::keymap::{char_to_key, parse_key};
-use crate::wayland::outputs;
-use crate::{Button, KeyAction, MouseAction};
+use super::keymap::{char_to_key, parse_key};
+use super::outputs;
+use crate::platform::keymap_common::split_chord;
+use crate::platform::types::{Button, KeyAction, MouseAction};
 use anyhow::{Context, Result, bail};
 use evdev::{
     AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode,
@@ -179,9 +180,9 @@ pub fn key(action: KeyAction) -> Result<()> {
             dev.emit(&[key_event(code, 0), syn()])?;
         }
         KeyAction::Chord { combo } => {
-            let parts: Vec<KeyCode> = combo
-                .split('+')
-                .map(|s| parse_key(s))
+            let parts: Vec<KeyCode> = split_chord(&combo)
+                .into_iter()
+                .map(parse_key)
                 .collect::<Result<_>>()?;
             if parts.is_empty() {
                 bail!("empty chord");
