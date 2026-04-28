@@ -16,6 +16,13 @@ cargo build --release
 
 You'll need `claude` (and/or `opencode`) on your `PATH`.
 
+If `codegraph` is also on `PATH` (or installed at
+`~/.printer/plugins/codegraph/bin/codegraph`), `printer run` and
+`printer exec` automatically launch a `codegraph watch` daemon for the
+duration of the operation so the on-disk index stays fresh as the agent
+edits files. Logs land in `.printer/codegraph-watch.log`. Pass
+`--no-codegraph-watch` to opt out.
+
 ## How it works
 
 `printer run` materializes the spec as **tasks in the on-disk task store**

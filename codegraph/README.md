@@ -18,6 +18,21 @@ codegraph index path/to/other/repo       # index a different root
 
 Re-run after substantial edits so search results stay accurate.
 
+### Keep the index live with `watch`
+
+```sh
+codegraph watch                          # foreground daemon: refresh on every change
+codegraph watch --debounce-ms 500        # coalesce bursts before re-indexing
+codegraph watch path/to/other/repo
+```
+
+`watch` does an initial indexing pass, then subscribes to filesystem events
+and re-indexes affected files (or removes deleted ones) as they change. It
+honors the same exclusion list as `index` (`.git`, `target`, `node_modules`,
+`dist`, `build`, `.next`, `.venv`, `__pycache__`, `.cache`, …) plus the
+repo's `.gitignore`. Run it under your supervisor of choice (`tmux`,
+`systemd --user`, `&`) to give agents an always-fresh `.codegraph/index.json`.
+
 ### Search the index
 
 ```sh

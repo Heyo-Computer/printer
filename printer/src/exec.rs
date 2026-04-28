@@ -1,5 +1,6 @@
 use crate::agent::TokenUsage;
 use crate::cli::{ExecArgs, ReviewArgs, RunArgs};
+use crate::codegraph_watch;
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
@@ -148,6 +149,18 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
 
     let action = decide(cli_spec_abs.as_deref(), args.r#continue, existing.as_ref())?;
 
+    // Spawn the codegraph watch daemon at the exec level so a single daemon
+    // covers both run and review. The inner run is configured (via
+    // build_run_args) with no_codegraph_watch=true so it won't double-spawn.
+    let _watch_guard = if args.no_codegraph_watch {
+        None
+    } else {
+        codegraph_watch::try_spawn(&cwd).unwrap_or_else(|e| {
+            eprintln!("[printer] codegraph watch spawn failed: {e}; continuing without daemon");
+            None
+        })
+    };
+
     let hooks = HookSet::load_installed().unwrap_or_default();
     let exec_spec: Option<PathBuf> = match &action {
         Action::Fresh { spec } | Action::ResumeRun { spec } | Action::ResumeReview { spec } => {
@@ -252,6 +265,9 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         cwd: args.cwd.clone(),
         permission_mode: args.permission_mode.clone(),
         verbose: args.verbose,
+        // Exec already owns the daemon (or chose not to spawn one); never
+        // double-spawn from the inner run.
+        no_codegraph_watch: true,
     }
 }
 

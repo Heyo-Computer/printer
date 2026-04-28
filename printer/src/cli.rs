@@ -84,6 +84,12 @@ pub struct RunArgs {
     /// is still working during long turns.
     #[arg(long, short, default_value_t = false)]
     pub verbose: bool,
+
+    /// Skip auto-spawning a `codegraph watch` daemon for the run. By default
+    /// printer launches one (if `codegraph` is installed) so the index stays
+    /// fresh as the agent edits files.
+    #[arg(long, default_value_t = false)]
+    pub no_codegraph_watch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -184,6 +190,12 @@ pub struct ExecArgs {
     /// `printer review --skill`. Repeatable.
     #[arg(long = "skill", value_name = "PATH")]
     pub skills: Vec<PathBuf>,
+
+    /// Skip auto-spawning a `codegraph watch` daemon for the duration of
+    /// the exec (run + review). By default printer launches one if
+    /// `codegraph` is installed.
+    #[arg(long, default_value_t = false)]
+    pub no_codegraph_watch: bool,
 }
 
 #[derive(clap::Args, Debug)]

@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod codegraph_watch;
 mod exec;
 mod hooks;
 mod init;

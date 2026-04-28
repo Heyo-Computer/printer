@@ -14,6 +14,39 @@ pub const INDEX_DIRNAME: &str = ".codegraph";
 pub const INDEX_FILENAME: &str = "index.json";
 pub const INDEX_VERSION: u32 = 1;
 
+/// Directory names that are always skipped, in addition to whatever
+/// `.gitignore` rules out. Kept in one place so the indexer and the watcher
+/// agree on what to ignore.
+pub const ALWAYS_EXCLUDED_DIRS: &[&str] = &[
+    INDEX_DIRNAME,
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    ".cache",
+];
+
+/// True if any path component matches one of `ALWAYS_EXCLUDED_DIRS`.
+pub fn is_path_excluded(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .map(|s| ALWAYS_EXCLUDED_DIRS.contains(&s))
+            .unwrap_or(false)
+    })
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
     pub mtime: u64,
@@ -98,7 +131,7 @@ pub fn build(root: &Path, force: bool) -> Result<(Index, BuildReport)> {
             entry
                 .file_name()
                 .to_str()
-                .map(|n| n != INDEX_DIRNAME && n != ".git" && n != "target" && n != "node_modules")
+                .map(|n| !ALWAYS_EXCLUDED_DIRS.contains(&n))
                 .unwrap_or(true)
         })
         .build();
@@ -150,6 +183,85 @@ pub fn build(root: &Path, force: bool) -> Result<(Index, BuildReport)> {
     }
 
     Ok((index, report))
+}
+
+/// Outcome of incrementally updating a single file in an existing index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// Indexed (created or refreshed).
+    Indexed,
+    /// File mtime + language unchanged; index entry was kept as-is.
+    Unchanged,
+    /// File is gone or unreadable; entry was removed if present.
+    Removed,
+    /// File extension is not a supported language; nothing to do.
+    Skipped,
+}
+
+/// Update a single file in `index`. Returns the outcome and a relative path
+/// (POSIX-style) string if the file lives under the index root.
+pub fn update_file(index: &mut Index, abs_path: &Path) -> Result<(UpdateOutcome, Option<String>)> {
+    let rel = match abs_path.strip_prefix(&index.root) {
+        Ok(p) => p.to_path_buf(),
+        Err(_) => return Ok((UpdateOutcome::Skipped, None)),
+    };
+    if is_path_excluded(&rel) {
+        return Ok((UpdateOutcome::Skipped, None));
+    }
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+    let Some(language) = Language::from_path(abs_path) else {
+        return Ok((UpdateOutcome::Skipped, Some(rel_str)));
+    };
+
+    let meta = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(_) => {
+            // Treat missing as a delete.
+            let removed = index.files.remove(&rel_str).is_some();
+            return Ok((
+                if removed { UpdateOutcome::Removed } else { UpdateOutcome::Skipped },
+                Some(rel_str),
+            ));
+        }
+    };
+    if !meta.is_file() {
+        return Ok((UpdateOutcome::Skipped, Some(rel_str)));
+    }
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if let Some(prev) = index.files.get(&rel_str) {
+        if prev.mtime == mtime && prev.language == language {
+            return Ok((UpdateOutcome::Unchanged, Some(rel_str)));
+        }
+    }
+
+    let parsed = parse::parse_path(abs_path)
+        .with_context(|| format!("parsing {}", abs_path.display()))?;
+    let symbols = symbols::extract(&parsed);
+    index.files.insert(
+        rel_str.clone(),
+        FileEntry {
+            mtime,
+            language,
+            symbols,
+        },
+    );
+    Ok((UpdateOutcome::Indexed, Some(rel_str)))
+}
+
+/// Drop an entry from the index. Returns true if something was removed.
+pub fn remove_file(index: &mut Index, abs_path: &Path) -> bool {
+    let Ok(rel) = abs_path.strip_prefix(&index.root) else {
+        return false;
+    };
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    index.files.remove(&rel_str).is_some()
 }
 
 fn file_mtime(path: &Path) -> Option<u64> {
