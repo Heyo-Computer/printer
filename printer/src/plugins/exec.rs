@@ -21,6 +21,12 @@ pub fn exec_external(args: &[OsString]) -> Result<()> {
         );
     }
     let manifest = store::read_manifest(&dir)?;
+    if manifest.binary.is_empty() {
+        bail!(
+            "plugin `{name}` is skill-only (no binary); it only contributes hooks/skills \
+             to run/review and cannot be invoked directly via `printer {name}`."
+        );
+    }
     let bin = dir.join(&manifest.binary);
     if !bin.is_file() {
         bail!(

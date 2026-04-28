@@ -1,5 +1,6 @@
 use crate::agent::TokenUsage;
-use crate::cli::{ExecArgs, ReviewArgs, RunArgs};
+use crate::cli::{ExecArgs, HistoryArgs, ReviewArgs, RunArgs};
+use crate::codegraph_watch;
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const CHECKPOINT_REL: &str = ".printer/exec.json";
+const HISTORY_REL: &str = ".printer/history.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,12 +22,128 @@ pub enum Phase {
     Done,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub spec: PathBuf,
     pub phase: Phase,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// One archived exec — a Checkpoint plus the time it was retired from
+/// `.printer/exec.json` (i.e. a follow-up spec replaced it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    #[serde(flatten)]
+    pub checkpoint: Checkpoint,
+    pub archived_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct History {
+    pub entries: Vec<HistoryEntry>,
+}
+
+impl History {
+    fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading history {}", path.display()))?;
+        let history: History = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing history {}", path.display()))?;
+        Ok(history)
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let body = serde_json::to_string_pretty(self).context("serializing history")?;
+        std::fs::write(path, body)
+            .with_context(|| format!("writing history {}", path.display()))?;
+        Ok(())
+    }
+
+    fn append(path: &Path, entry: HistoryEntry) -> Result<()> {
+        let mut h = Self::load(path)?;
+        h.entries.push(entry);
+        h.save(path)
+    }
+}
+
+pub fn history_path(cwd: &Path) -> PathBuf {
+    cwd.join(HISTORY_REL)
+}
+
+pub fn load_history(cwd: &Path) -> Result<History> {
+    History::load(&history_path(cwd))
+}
+
+pub fn print_history(args: HistoryArgs) -> Result<()> {
+    let cwd: PathBuf = match args.cwd.as_deref() {
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("--cwd not found: {}", p.display()))?,
+        None => std::env::current_dir()?,
+    };
+
+    let history = load_history(&cwd)?;
+    let current_path = cwd.join(CHECKPOINT_REL);
+    let current = if current_path.exists() {
+        Some(Checkpoint::load(&current_path)?)
+    } else {
+        None
+    };
+
+    if args.json {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            current: Option<&'a Checkpoint>,
+            history: &'a History,
+        }
+        let out = Out {
+            current: current.as_ref(),
+            history: &history,
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if history.entries.is_empty() && current.is_none() {
+        println!("No exec history at {}.", history_path(&cwd).display());
+        return Ok(());
+    }
+
+    if !history.entries.is_empty() {
+        println!("Archived execs ({}):", history.entries.len());
+        for (i, e) in history.entries.iter().enumerate() {
+            println!(
+                "  [{}] {}  phase={:?}  started={}  finished={}  archived={}",
+                i + 1,
+                e.checkpoint.spec.display(),
+                e.checkpoint.phase,
+                e.checkpoint.started_at.to_rfc3339(),
+                e.checkpoint.updated_at.to_rfc3339(),
+                e.archived_at.to_rfc3339(),
+            );
+        }
+    }
+
+    if let Some(cp) = current {
+        println!(
+            "\nCurrent checkpoint ({}): {}  phase={:?}  started={}  updated={}",
+            current_path.display(),
+            cp.spec.display(),
+            cp.phase,
+            cp.started_at.to_rfc3339(),
+            cp.updated_at.to_rfc3339(),
+        );
+    }
+
+    Ok(())
 }
 
 impl Checkpoint {
@@ -72,6 +190,9 @@ enum Action {
     ResumeReview { spec: PathBuf },
     /// Already done; nothing to do.
     AlreadyDone { spec: PathBuf },
+    /// Prior exec for a different spec finished cleanly; archive it to
+    /// history and start a fresh exec for the new spec.
+    FreshAfterDone { spec: PathBuf, prior: Checkpoint },
 }
 
 /// Pure decision function — no I/O, no agent spawning. The caller has already
@@ -113,12 +234,27 @@ fn decide(
                 Phase::Done => Action::AlreadyDone { spec: cp.spec.clone() },
             })
         }
-        (false, Some(cp), Some(spec)) => bail!(
-            "checkpoint at {CHECKPOINT_REL} is for spec {}; refusing to overwrite with {}. \
-             Pass --continue, or remove the checkpoint to start fresh.",
-            cp.spec.display(),
-            spec.display()
-        ),
+        (false, Some(cp), Some(spec)) => {
+            // Different spec from the checkpoint. If the prior exec finished
+            // cleanly, treat this as a follow-up: archive the old checkpoint
+            // and start fresh. Otherwise the prior exec is still in flight,
+            // so refuse to clobber it.
+            if cp.phase == Phase::Done {
+                Ok(Action::FreshAfterDone {
+                    spec: spec.to_path_buf(),
+                    prior: cp.clone(),
+                })
+            } else {
+                bail!(
+                    "checkpoint at {CHECKPOINT_REL} is for spec {} (phase {:?}); \
+                     refusing to overwrite with {}. Pass --continue to resume the \
+                     prior exec, or remove the checkpoint to start fresh.",
+                    cp.spec.display(),
+                    cp.phase,
+                    spec.display()
+                )
+            }
+        }
         (false, _, None) => bail!("missing spec path (required unless --continue is set)"),
     }
 }
@@ -148,12 +284,25 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
 
     let action = decide(cli_spec_abs.as_deref(), args.r#continue, existing.as_ref())?;
 
+    // Spawn the codegraph watch daemon at the exec level so a single daemon
+    // covers both run and review. The inner run is configured (via
+    // build_run_args) with no_codegraph_watch=true so it won't double-spawn.
+    let _watch_guard = if args.no_codegraph_watch {
+        None
+    } else {
+        codegraph_watch::try_spawn(&cwd).unwrap_or_else(|e| {
+            eprintln!("[printer] codegraph watch spawn failed: {e}; continuing without daemon");
+            None
+        })
+    };
+
     let hooks = HookSet::load_installed().unwrap_or_default();
     let exec_spec: Option<PathBuf> = match &action {
-        Action::Fresh { spec } | Action::ResumeRun { spec } | Action::ResumeReview { spec } => {
-            Some(spec.clone())
-        }
-        Action::AlreadyDone { spec } => Some(spec.clone()),
+        Action::Fresh { spec }
+        | Action::ResumeRun { spec }
+        | Action::ResumeReview { spec }
+        | Action::AlreadyDone { spec }
+        | Action::FreshAfterDone { spec, .. } => Some(spec.clone()),
     };
     {
         let mut ctx = HookContext::new(Event::BeforeExec, cwd.clone());
@@ -183,7 +332,6 @@ async fn run_action(
     action: Action,
     existing: Option<Checkpoint>,
 ) -> Result<()> {
-    let _ = cwd;
     let total = match action {
         Action::AlreadyDone { spec } => {
             eprintln!(
@@ -195,6 +343,23 @@ async fn run_action(
             return Ok(());
         }
         Action::Fresh { spec } => {
+            let cp = Checkpoint::new(spec.clone(), Phase::Running);
+            cp.save(&checkpoint_path)?;
+            do_run_then_review(&args, &spec, &checkpoint_path).await?
+        }
+        Action::FreshAfterDone { spec, prior } => {
+            let history_file = cwd.join(HISTORY_REL);
+            let entry = HistoryEntry {
+                checkpoint: prior.clone(),
+                archived_at: Utc::now(),
+            };
+            History::append(&history_file, entry)?;
+            eprintln!(
+                "[printer] archived prior exec for {} to {} (phase=done); starting fresh for {}",
+                prior.spec.display(),
+                history_file.display(),
+                spec.display()
+            );
             let cp = Checkpoint::new(spec.clone(), Phase::Running);
             cp.save(&checkpoint_path)?;
             do_run_then_review(&args, &spec, &checkpoint_path).await?
@@ -252,6 +417,9 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         cwd: args.cwd.clone(),
         permission_mode: args.permission_mode.clone(),
         verbose: args.verbose,
+        // Exec already owns the daemon (or chose not to spawn one); never
+        // double-spawn from the inner run.
+        no_codegraph_watch: true,
     }
 }
 
@@ -333,10 +501,53 @@ mod tests {
     }
 
     #[test]
-    fn fresh_with_existing_checkpoint_for_different_spec_errors() {
+    fn fresh_with_running_checkpoint_for_different_spec_errors() {
         let c = cp("/tmp/a.md", Phase::Running);
         let err = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap_err();
         assert!(err.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn fresh_with_review_pending_checkpoint_for_different_spec_errors() {
+        let c = cp("/tmp/a.md", Phase::ReviewPending);
+        let err = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn fresh_with_done_checkpoint_for_different_spec_archives() {
+        let c = cp("/tmp/a.md", Phase::Done);
+        let action = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap();
+        match action {
+            Action::FreshAfterDone { spec, prior } => {
+                assert_eq!(spec, PathBuf::from("/tmp/b.md"));
+                assert_eq!(prior.spec, PathBuf::from("/tmp/a.md"));
+                assert_eq!(prior.phase, Phase::Done);
+            }
+            other => panic!("expected FreshAfterDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let entry = HistoryEntry {
+            checkpoint: cp("/tmp/a.md", Phase::Done),
+            archived_at: Utc::now(),
+        };
+        History::append(&path, entry.clone()).unwrap();
+
+        let entry2 = HistoryEntry {
+            checkpoint: cp("/tmp/b.md", Phase::Done),
+            archived_at: Utc::now(),
+        };
+        History::append(&path, entry2).unwrap();
+
+        let loaded = History::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[0].checkpoint.spec, PathBuf::from("/tmp/a.md"));
+        assert_eq!(loaded.entries[1].checkpoint.spec, PathBuf::from("/tmp/b.md"));
     }
 
     #[test]

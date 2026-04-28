@@ -1,5 +1,6 @@
 use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::RunArgs;
+use crate::codegraph_watch;
 use crate::hooks::{AgentContribution, Event, HookContext, HookSet};
 use crate::prompts::{
     bootstrap_prompt, nudge_prompt_with, rotation_prompt, unstall_prompt, SENTINEL_BLOCKED,
@@ -37,6 +38,15 @@ pub async fn run(args: RunArgs) -> Result<TokenUsage> {
             tasks_dir.display()
         )
     })?;
+
+    let _watch_guard = if args.no_codegraph_watch {
+        None
+    } else {
+        codegraph_watch::try_spawn(&cwd).unwrap_or_else(|e| {
+            eprintln!("[printer] codegraph watch spawn failed: {e}; continuing without daemon");
+            None
+        })
+    };
 
     hooks.run_cli(
         Event::BeforeRun,

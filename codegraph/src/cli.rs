@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -7,7 +8,7 @@ use clap::{Parser, Subcommand};
 use crate::index::{self, Index};
 use crate::languages::SymbolKind;
 use crate::output::{self, Format};
-use crate::{outline, parse, patch, search, snippet, symbols};
+use crate::{outline, parse, patch, search, snippet, symbols, watch};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +34,15 @@ pub enum Command {
         /// Rebuild from scratch instead of reusing the previous index.
         #[arg(long)]
         force: bool,
+    },
+    /// Run a foreground daemon that incrementally re-indexes on file changes.
+    Watch {
+        /// Repo root to watch. Defaults to the current directory.
+        path: Option<PathBuf>,
+        /// Coalesce bursts of file events for this many milliseconds before
+        /// reindexing.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
     },
     /// List symbols in a single file (functions, classes, etc.).
     Symbols {
@@ -91,6 +101,7 @@ pub fn run() -> Result<ExitCode> {
     let fmt = if cli.text { Format::Text } else { Format::Json };
     match cli.command {
         Command::Index { path, force } => cmd_index(path, force, fmt),
+        Command::Watch { path, debounce_ms } => cmd_watch(path, debounce_ms),
         Command::Symbols { file } => cmd_symbols(file, fmt),
         Command::Outline { file } => cmd_outline(file, fmt),
         Command::Snippet {
@@ -153,6 +164,15 @@ fn cmd_index(path: Option<PathBuf>, force: bool, fmt: Format) -> Result<ExitCode
             }
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_watch(path: Option<PathBuf>, debounce_ms: u64) -> Result<ExitCode> {
+    let root = path.unwrap_or_else(|| PathBuf::from("."));
+    watch::run(watch::WatchOpts {
+        root,
+        debounce: Duration::from_millis(debounce_ms),
+    })?;
     Ok(ExitCode::SUCCESS)
 }
 

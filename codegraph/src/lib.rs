@@ -8,3 +8,4 @@ pub mod patch;
 pub mod search;
 pub mod snippet;
 pub mod symbols;
+pub mod watch;

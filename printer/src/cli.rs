@@ -19,6 +19,8 @@ pub enum Command {
     Review(ReviewArgs),
     /// Run-then-review in one shot, with crash-safe `--continue`.
     Exec(ExecArgs),
+    /// Show the archive of completed execs (`.printer/history.json`).
+    History(HistoryArgs),
     /// File-based task tracking (create / list / start / done / ...).
     #[command(subcommand_help_heading = "Task subcommands")]
     Task(crate::tasks::TaskArgs),
@@ -84,6 +86,12 @@ pub struct RunArgs {
     /// is still working during long turns.
     #[arg(long, short, default_value_t = false)]
     pub verbose: bool,
+
+    /// Skip auto-spawning a `codegraph watch` daemon for the run. By default
+    /// printer launches one (if `codegraph` is installed) so the index stays
+    /// fresh as the agent edits files.
+    #[arg(long, default_value_t = false)]
+    pub no_codegraph_watch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -184,6 +192,23 @@ pub struct ExecArgs {
     /// `printer review --skill`. Repeatable.
     #[arg(long = "skill", value_name = "PATH")]
     pub skills: Vec<PathBuf>,
+
+    /// Skip auto-spawning a `codegraph watch` daemon for the duration of
+    /// the exec (run + review). By default printer launches one if
+    /// `codegraph` is installed.
+    #[arg(long, default_value_t = false)]
+    pub no_codegraph_watch: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct HistoryArgs {
+    /// Working directory containing `.printer/history.json`.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Emit the raw JSON instead of a human-readable summary.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]
