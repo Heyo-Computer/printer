@@ -4,6 +4,7 @@ use clap::{Subcommand, ValueEnum};
 pub enum MouseAction {
     /// Move pointer to absolute position. On Linux this is pixels on a chosen
     /// output; on macOS it's points in the global display coordinate space.
+    #[command(allow_negative_numbers = true)]
     Move {
         x: i32,
         y: i32,
@@ -11,6 +12,7 @@ pub enum MouseAction {
         output: Option<String>,
     },
     /// Move pointer relative by dx,dy.
+    #[command(allow_negative_numbers = true)]
     MoveRel { dx: i32, dy: i32 },
     /// Click a button.
     Click {
@@ -30,6 +32,7 @@ pub enum MouseAction {
         button: Button,
     },
     /// Scroll by (dx,dy). Positive y = scroll down.
+    #[command(allow_negative_numbers = true)]
     Scroll { dx: i32, dy: i32 },
 }
 
