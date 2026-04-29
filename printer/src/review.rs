@@ -8,7 +8,73 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub async fn review(args: ReviewArgs) -> Result<TokenUsage> {
+/// Verdict parsed out of the review report's `## Verdict` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Partial,
+    Fail,
+    /// Could not parse a verdict from the report (treat as fail-safe).
+    Unknown,
+}
+
+impl Verdict {
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Verdict::Pass)
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Verdict::Pass => "PASS",
+            Verdict::Partial => "PARTIAL",
+            Verdict::Fail => "FAIL",
+            Verdict::Unknown => "UNKNOWN",
+        })
+    }
+}
+
+/// Normalized result of a single review turn.
+#[derive(Debug, Clone)]
+pub struct ReviewOutcome {
+    pub usage: TokenUsage,
+    pub verdict: Verdict,
+    pub report: String,
+}
+
+/// Parse the verdict out of a review report. We look for a `## Verdict`
+/// section heading and pick up the first PASS / PARTIAL / FAIL token after it.
+/// Falls back to scanning the whole report if the heading is missing.
+pub fn parse_verdict(report: &str) -> Verdict {
+    let lower = report.to_ascii_lowercase();
+    let scan = match lower.find("## verdict") {
+        Some(idx) => &lower[idx..],
+        None => lower.as_str(),
+    };
+    // Pick the first explicit verdict token.
+    let pass_at = scan.find("pass");
+    let partial_at = scan.find("partial");
+    let fail_at = scan.find("fail");
+    let mut best: Option<(usize, Verdict)> = None;
+    for cand in [
+        partial_at.map(|i| (i, Verdict::Partial)),
+        pass_at.map(|i| (i, Verdict::Pass)),
+        fail_at.map(|i| (i, Verdict::Fail)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        best = Some(match best {
+            None => cand,
+            Some(cur) if cand.0 < cur.0 => cand,
+            Some(cur) => cur,
+        });
+    }
+    best.map(|(_, v)| v).unwrap_or(Verdict::Unknown)
+}
+
+pub async fn review(args: ReviewArgs) -> Result<ReviewOutcome> {
     let hooks = HookSet::load_installed().unwrap_or_default();
 
     let spec_abs = args
@@ -90,10 +156,53 @@ pub async fn review(args: ReviewArgs) -> Result<TokenUsage> {
     let _ = hooks.run_cli(Event::AfterReview, &after_ctx);
 
     let usage = session.usage_total;
-    if result.is_ok() {
-        eprintln!("[printer] review token usage: {usage}");
+    let report = result?;
+    let verdict = parse_verdict(&report);
+    eprintln!("[printer] review verdict: {verdict}");
+    eprintln!("[printer] review token usage: {usage}");
+    Ok(ReviewOutcome {
+        usage,
+        verdict,
+        report,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pass_verdict() {
+        let report = "## Verdict\nPASS\n\n## Per-item findings\n- foo MET\n";
+        assert_eq!(parse_verdict(report), Verdict::Pass);
     }
-    result.map(|_| usage)
+
+    #[test]
+    fn parses_partial_verdict() {
+        let report = "## Verdict\nPARTIAL — two items missing.\n";
+        assert_eq!(parse_verdict(report), Verdict::Partial);
+    }
+
+    #[test]
+    fn parses_fail_verdict() {
+        let report = "## Verdict\nFAIL\nseveral items missing.\n";
+        assert_eq!(parse_verdict(report), Verdict::Fail);
+    }
+
+    #[test]
+    fn unknown_when_no_verdict_section() {
+        let report = "lots of prose with no verdict here\n";
+        assert_eq!(parse_verdict(report), Verdict::Unknown);
+    }
+
+    #[test]
+    fn ignores_pass_in_per_item_findings() {
+        // No `## Verdict` section, but the body uses MET / MISSING tokens.
+        // We still scan the whole text — accept the first hit, prefer PARTIAL
+        // over FAIL/PASS when ambiguous.
+        let report = "## Per-item findings\n- foo MET\n- bar MISSING (partial coverage)\n";
+        assert_eq!(parse_verdict(report), Verdict::Partial);
+    }
 }
 
 fn detect_base(cwd: Option<&Path>) -> Option<String> {

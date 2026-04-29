@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 
 const CHECKPOINT_REL: &str = ".printer/exec.json";
 const HISTORY_REL: &str = ".printer/history.json";
+/// Default upper bound on review cycles (one initial review + N-1 follow-ups).
+/// Each non-PASS verdict triggers a fix pass and another review, so this caps
+/// how many round-trips we'll attempt before giving up.
+pub const DEFAULT_MAX_REVIEW_PASSES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,6 +264,7 @@ fn decide(
 }
 
 pub async fn exec(args: ExecArgs) -> Result<()> {
+    crate::plugins::prompt_if_no_plugins(args.skip_plugin_check)?;
     let cwd: PathBuf = match args.cwd.as_deref() {
         Some(p) => p
             .canonicalize()
@@ -389,10 +394,54 @@ async fn do_run_then_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Res
     Ok(total)
 }
 
+/// Drive the review phase, with up to `max_review_passes` cycles of
+/// review → fix → re-review. Each iteration:
+///   1. runs the review agent and parses its verdict
+///   2. if PASS, we're done
+///   3. otherwise, feeds the report to the coding agent (which queues fix
+///      tasks and works them) and loops back to (1)
+/// Stops early if the verdict is PASS or the cap is hit.
 async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<TokenUsage> {
-    let usage = review::review(build_review_args(args, spec)).await?;
+    let max_passes = args
+        .max_review_passes
+        .unwrap_or(DEFAULT_MAX_REVIEW_PASSES)
+        .max(1);
+    let mut total = TokenUsage::default();
+
+    for pass in 1..=max_passes {
+        eprintln!("[printer] review pass {pass}/{max_passes}");
+        let outcome = review::review(build_review_args(args, spec)).await?;
+        total.add(&outcome.usage);
+
+        if outcome.verdict.is_pass() {
+            eprintln!("[printer] review verdict PASS on pass {pass}; finishing");
+            break;
+        }
+
+        if pass == max_passes {
+            eprintln!(
+                "[printer] review verdict {} on final pass {pass}/{max_passes}; \
+                 stopping cycle without a PASS",
+                outcome.verdict
+            );
+            break;
+        }
+
+        eprintln!(
+            "[printer] review verdict {} on pass {pass}; feeding report back to coding agent",
+            outcome.verdict
+        );
+        let fix_usage = run::run_with_feedback(
+            build_run_args(args, spec),
+            Some(outcome.report.as_str()),
+        )
+        .await
+        .with_context(|| format!("fix pass after review pass {pass} failed"))?;
+        total.add(&fix_usage);
+    }
+
     write_phase(cp_path, spec, Phase::Done)?;
-    Ok(usage)
+    Ok(total)
 }
 
 fn write_phase(cp_path: &Path, spec: &Path, phase: Phase) -> Result<()> {
@@ -420,6 +469,9 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         // Exec already owns the daemon (or chose not to spawn one); never
         // double-spawn from the inner run.
         no_codegraph_watch: true,
+        // Exec already ran the plugin check up front; suppress it inside the
+        // nested run so we don't re-prompt the user mid-exec.
+        skip_plugin_check: true,
     }
 }
 

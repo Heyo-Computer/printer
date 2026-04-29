@@ -4,6 +4,7 @@ mod codegraph_watch;
 mod exec;
 mod hooks;
 mod init;
+mod plan;
 mod plugins;
 mod prompts;
 mod review;
@@ -21,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         cli::Command::Init(args) => init::init(args),
         cli::Command::Run(args) => run::run(args).await.map(|_| ()),
+        cli::Command::Plan(args) => plan::plan(args).await.map(|_| ()),
         cli::Command::Review(args) => review::review(args).await.map(|_| ()),
         cli::Command::Exec(args) => exec::exec(args).await,
         cli::Command::History(args) => exec::print_history(args),

@@ -15,6 +15,10 @@ pub enum Command {
     Init(InitArgs),
     /// Plan and execute a markdown spec.
     Run(RunArgs),
+    /// Generate a detailed plan from a spec without executing any work.
+    /// Writes a checkpoint to `.printer/plan.checkpoint` and lets the agent
+    /// optionally ask the user clarifying questions before locking the plan in.
+    Plan(PlanArgs),
     /// Review the working tree against the original spec.
     Review(ReviewArgs),
     /// Run-then-review in one shot, with crash-safe `--continue`.
@@ -92,6 +96,47 @@ pub struct RunArgs {
     /// fresh as the agent edits files.
     #[arg(long, default_value_t = false)]
     pub no_codegraph_watch: bool,
+
+    /// Skip the "no plugins installed" interactive check. Use this in CI where
+    /// stdin is not a terminal and the run is intentionally plugin-free.
+    #[arg(long, default_value_t = false)]
+    pub skip_plugin_check: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PlanArgs {
+    /// Path to the markdown spec / todo file.
+    pub spec: PathBuf,
+
+    /// Which agent to drive.
+    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    pub agent: AgentKind,
+
+    /// Override the model.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Working directory for the child agent process.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Permission mode passed to the child agent.
+    #[arg(long, default_value = "bypassPermissions")]
+    pub permission_mode: String,
+
+    /// Show a live spinner / heartbeats during the planning turn.
+    #[arg(long, short, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Skip the optional question/answer round even if the agent asks.
+    /// Useful in CI / non-interactive contexts.
+    #[arg(long, default_value_t = false)]
+    pub no_questions: bool,
+
+    /// Maximum number of question/answer rounds before the plan is forced to
+    /// finalize.
+    #[arg(long, default_value_t = 3)]
+    pub max_question_rounds: u32,
 }
 
 #[derive(clap::Args, Debug)]
@@ -198,6 +243,19 @@ pub struct ExecArgs {
     /// `codegraph` is installed.
     #[arg(long, default_value_t = false)]
     pub no_codegraph_watch: bool,
+
+    /// Skip the "no plugins installed" interactive check. Use this in CI where
+    /// stdin is not a terminal and the run is intentionally plugin-free.
+    #[arg(long, default_value_t = false)]
+    pub skip_plugin_check: bool,
+
+    /// Maximum number of review cycles (review → fix → re-review). Each
+    /// non-PASS verdict triggers a fix pass and another review, so this is
+    /// the cap on round-trips before exec gives up. Defaults to
+    /// `DEFAULT_MAX_REVIEW_PASSES` in `exec.rs` (currently 3). Set to 1 to
+    /// disable the cycle entirely (single review, no fix pass).
+    #[arg(long)]
+    pub max_review_passes: Option<u32>,
 }
 
 #[derive(clap::Args, Debug)]

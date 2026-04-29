@@ -3,8 +3,8 @@ use crate::cli::RunArgs;
 use crate::codegraph_watch;
 use crate::hooks::{AgentContribution, Event, HookContext, HookSet};
 use crate::prompts::{
-    bootstrap_prompt, nudge_prompt_with, rotation_prompt, unstall_prompt, SENTINEL_BLOCKED,
-    SENTINEL_DONE,
+    bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with, planning_prompt, rotation_prompt,
+    unstall_prompt, SENTINEL_BLOCKED, SENTINEL_DONE,
 };
 use crate::session::Session;
 use crate::skills;
@@ -16,6 +16,18 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 pub async fn run(args: RunArgs) -> Result<TokenUsage> {
+    run_with_feedback(args, None).await
+}
+
+/// Same as [`run`], but if `review_feedback` is `Some(report)`, the agent is
+/// shown the prior review report on its first turn and asked to add or reopen
+/// tasks to address the findings. Used by the exec review-cycle to feed
+/// reviewer output back into the coding agent.
+pub async fn run_with_feedback(
+    args: RunArgs,
+    review_feedback: Option<&str>,
+) -> Result<TokenUsage> {
+    crate::plugins::prompt_if_no_plugins(args.skip_plugin_check)?;
     let hooks = HookSet::load_installed().unwrap_or_default();
     let spec_abs = args
         .spec
@@ -72,6 +84,7 @@ pub async fn run(args: RunArgs) -> Result<TokenUsage> {
         &tasks_dir,
         injected_block.as_deref(),
         &resolved_skills,
+        review_feedback,
     )
     .await;
 
@@ -101,6 +114,7 @@ async fn run_inner(
     tasks_dir: &std::path::Path,
     injected_block: Option<&str>,
     injected_skills: &[skills::Skill],
+    review_feedback: Option<&str>,
 ) -> Result<TokenUsage> {
     let printer_bin = std::env::current_exe()
         .context("resolving printer binary path for the agent prompt")?;
@@ -142,6 +156,40 @@ async fn run_inner(
         }
     }
 
+    // Planning pass: before any code work begins, ask the agent to refine the
+    // parsed tasks into a detailed actionable plan (notes, splits, deps). This
+    // runs unconditionally so a "valid" spec still gets a planning checkpoint.
+    // Skipped if every task is already done — no point planning finished work.
+    {
+        let tasks = store::list_all(tasks_dir)?;
+        if !all_done(&tasks) {
+            eprintln!("[printer] planning pass: refining {} task(s) into actionable plan entries", tasks.len());
+            let outcome = session
+                .turn(&planning_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
+                .await?;
+            print_result_tail(&outcome.result_text);
+            if let Some(reason) = blocked_reason(&outcome.result_text) {
+                anyhow::bail!("agent reported blocked during planning: {reason}");
+            }
+        }
+    }
+
+    // If the caller supplied review feedback, give the agent one turn to
+    // ingest it and queue follow-up tasks before the normal loop starts. We
+    // do this *after* spec sync so the agent can see the existing task store,
+    // and we re-list tasks afterwards so the loop's stall detection has a
+    // fresh baseline.
+    if let Some(feedback) = review_feedback {
+        eprintln!("[printer] feeding review report back to coding agent");
+        let outcome = session
+            .turn(&fix_from_review_prompt(&printer_bin_str, feedback))
+            .await?;
+        print_result_tail(&outcome.result_text);
+        if let Some(reason) = blocked_reason(&outcome.result_text) {
+            anyhow::bail!("agent reported blocked while ingesting review: {reason}");
+        }
+    }
+
     // Execute loop.
     let mut tasks = store::list_all(tasks_dir)?;
     let mut prev_state_hash = state_hash(&tasks);
@@ -160,12 +208,30 @@ async fn run_inner(
                 session.cumulative_input_tokens, args.compact_at
             );
             session.rotate();
+            // First turn of the new session: orient the agent to the world.
             let outcome = session
                 .turn(&rotation_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
                 .await?;
             print_result_tail(&outcome.result_text);
             if let Some(reason) = blocked_reason(&outcome.result_text) {
                 anyhow::bail!("agent reported blocked: {reason}");
+            }
+            tasks = store::list_all(tasks_dir)?;
+            if all_done(&tasks) {
+                eprintln!("[printer] all tasks done.");
+                return Ok(session.usage_total);
+            }
+            // Replan before resuming code work: a fresh session has no memory
+            // of the prior plan, so we ask it to refresh task notes against
+            // the current state of the store + tree before the nudge loop
+            // resumes.
+            eprintln!("[printer] post-rotation planning pass: refreshing plan against current state");
+            let outcome = session
+                .turn(&planning_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))
+                .await?;
+            print_result_tail(&outcome.result_text);
+            if let Some(reason) = blocked_reason(&outcome.result_text) {
+                anyhow::bail!("agent reported blocked during post-rotation planning: {reason}");
             }
             tasks = store::list_all(tasks_dir)?;
             prev_state_hash = state_hash(&tasks);

@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,85 @@ pub fn write_manifest(plugin_dir: &Path, manifest: &Manifest) -> Result<()> {
 pub fn installed(name: &str) -> Result<bool> {
     let dir = plugin_dir(name)?;
     Ok(manifest_path(&dir).is_file())
+}
+
+/// True iff stdout/stdin are connected to a terminal — used to decide
+/// whether `prompt_if_no_plugins` can interactively ask for confirmation.
+fn stdio_is_tty() -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDERR_FILENO) == 1
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// If no plugins are installed, warn the user and (when running interactively)
+/// ask for confirmation before proceeding. `skip` short-circuits the check —
+/// callers wire it to a `--skip-plugin-check` CLI flag for CI use.
+///
+/// Returns `Ok(())` when execution should proceed. Returns an error if the
+/// caller should abort (user said no, or non-interactive without `--skip`).
+pub fn prompt_if_no_plugins(skip: bool) -> Result<()> {
+    if skip {
+        return Ok(());
+    }
+    let count = installed_count()?;
+    if count > 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[printer] no plugins installed under ~/.printer/plugins/. \
+         Plugins contribute lifecycle hooks, prompt blocks, and skills the agent uses; \
+         without them the run will only see the spec. \
+         Install one with `printer add-plugin <name>`."
+    );
+
+    if !stdio_is_tty() {
+        bail!(
+            "no plugins installed and stdin is not a terminal — pass --skip-plugin-check to \
+             continue without plugins (e.g. for CI), or install a plugin first"
+        );
+    }
+
+    eprint!("[printer] continue without plugins? [y/N] ");
+    std::io::stderr().flush().ok();
+
+    let mut line = String::new();
+    let stdin = std::io::stdin();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("reading plugin-check confirmation from stdin")?;
+    let answer = line.trim().to_ascii_lowercase();
+    if matches!(answer.as_str(), "y" | "yes") {
+        Ok(())
+    } else {
+        bail!("aborted: no plugins installed (re-run with --skip-plugin-check to bypass)");
+    }
+}
+
+/// Count installed plugins (directories under `~/.printer/plugins/` that
+/// contain a `plugin.toml`). Used by `run`/`exec` to warn when the user is
+/// driving an agent with zero plugin contributions.
+pub fn installed_count() -> Result<usize> {
+    let plugins = plugins_dir()?;
+    let mut n = 0;
+    for entry in fs::read_dir(&plugins)
+        .with_context(|| format!("reading {}", plugins.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if manifest_path(&entry.path()).is_file() {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// List installed plugins (sorted by name).
