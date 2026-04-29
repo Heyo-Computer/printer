@@ -1,19 +1,22 @@
 use crate::cli::InitArgs;
 use crate::hooks::{Event, HookContext, HookSet};
+use crate::specs_paths::{next_numbered_spec_path, validate_slug};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn init(args: InitArgs) -> Result<()> {
-    let path = args.path.unwrap_or_else(|| PathBuf::from("spec.md"));
+    let project_root = std::env::current_dir()
+        .context("resolving current directory for project root")?;
+    let printer_dir_exists = project_root.join(".printer").is_dir();
+
+    let path = resolve_target(&project_root, args.path.as_deref(), printer_dir_exists)?;
     if path.exists() && !args.force {
         bail!(
             "{} already exists; pass --force to overwrite",
             path.display()
         );
     }
-    let project_root = std::env::current_dir()
-        .context("resolving current directory for project root")?;
 
     let hooks = HookSet::load_installed().unwrap_or_default();
     hooks.run_cli(
@@ -42,10 +45,48 @@ pub fn init(args: InitArgs) -> Result<()> {
 
     result?;
     eprintln!(
-        "Edit the checklist, then run `printer run {}` to drive the work.",
+        "Edit the checklist, then run `printer plan {}` to draft the plan.",
         path.display()
     );
     Ok(())
+}
+
+/// Decide where the spec file should land based on whether the project has
+/// already been initialized with printer (`.printer/` present). In a fresh
+/// repo the arg is a path (default `spec.md`); in an initialized repo the arg
+/// is required and treated as a slug producing `specs/NNN-<slug>.md`.
+fn resolve_target(
+    project_root: &Path,
+    arg: Option<&Path>,
+    printer_dir_exists: bool,
+) -> Result<PathBuf> {
+    if !printer_dir_exists {
+        return Ok(arg
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("spec.md")));
+    }
+    // Initialized repo: arg must be a slug.
+    let slug = arg
+        .and_then(|p| p.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this repo already has a .printer/ directory; pass a slug like \
+                 `printer init feat-deploy-assets` to write specs/NNN-<slug>.md"
+            )
+        })?;
+    if slug.contains(std::path::MAIN_SEPARATOR) {
+        bail!(
+            "expected a slug (e.g. `feat-deploy-assets`) but got a path: {}",
+            slug
+        );
+    }
+    validate_slug(slug)?;
+    let abs = next_numbered_spec_path(project_root, slug)?;
+    // Return relative-to-cwd if possible so eprintln!s stay tidy.
+    Ok(abs
+        .strip_prefix(project_root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or(abs))
 }
 
 /// Create the `.printer/` skeleton (`.printer/tasks/`) so `printer run` and
@@ -97,6 +138,53 @@ fn bootstrap_codegraph_index(root: &Path) {
         Err(e) => {
             eprintln!("[printer] could not invoke codegraph: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_mode_defaults_to_spec_md() {
+        let dir = tempdir().unwrap();
+        let p = resolve_target(dir.path(), None, false).unwrap();
+        assert_eq!(p, PathBuf::from("spec.md"));
+    }
+
+    #[test]
+    fn legacy_mode_accepts_explicit_path() {
+        let dir = tempdir().unwrap();
+        let arg = PathBuf::from("foo/bar.md");
+        let p = resolve_target(dir.path(), Some(&arg), false).unwrap();
+        assert_eq!(p, PathBuf::from("foo/bar.md"));
+    }
+
+    #[test]
+    fn slug_mode_routes_to_numbered_specs() {
+        let dir = tempdir().unwrap();
+        let specs = dir.path().join("specs");
+        std::fs::create_dir_all(&specs).unwrap();
+        std::fs::write(specs.join("001-old.md"), "").unwrap();
+        let arg = PathBuf::from("feat-x");
+        let p = resolve_target(dir.path(), Some(&arg), true).unwrap();
+        assert_eq!(p, PathBuf::from("specs/002-feat-x.md"));
+    }
+
+    #[test]
+    fn slug_mode_requires_arg() {
+        let dir = tempdir().unwrap();
+        let err = resolve_target(dir.path(), None, true).unwrap_err();
+        assert!(err.to_string().contains("slug"));
+    }
+
+    #[test]
+    fn slug_mode_rejects_path_argument() {
+        let dir = tempdir().unwrap();
+        let arg = PathBuf::from("a/b");
+        let err = resolve_target(dir.path(), Some(&arg), true).unwrap_err();
+        assert!(err.to_string().contains("slug"));
     }
 }
 

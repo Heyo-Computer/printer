@@ -25,6 +25,10 @@ pub enum Command {
     Exec(ExecArgs),
     /// Show the archive of completed execs (`.printer/history.json`).
     History(HistoryArgs),
+    /// Generate a new numbered spec from a saved follow-ups file.
+    /// Spawns one agent turn that converts `.printer/followups/<spec>.md`
+    /// (produced by `printer review`) into `specs/NNN-<slug>.md`.
+    SpecFromFollowups(SpecFromFollowupsArgs),
     /// File-based task tracking (create / list / start / done / ...).
     #[command(subcommand_help_heading = "Task subcommands")]
     Task(crate::tasks::TaskArgs),
@@ -42,7 +46,15 @@ pub enum Command {
 
 #[derive(clap::Args, Debug)]
 pub struct InitArgs {
-    /// Path to write the spec template. Defaults to `spec.md` in the cwd.
+    /// Where to write the spec template.
+    ///
+    /// Two modes, chosen by whether `.printer/` already exists in the cwd:
+    ///
+    /// - **Fresh repo** (no `.printer/`): treated as a path. Defaults to
+    ///   `spec.md`.
+    /// - **Existing printer repo** (`.printer/` present): treated as a slug
+    ///   and the spec is written to `specs/NNN-<slug>.md` with `NNN`
+    ///   auto-incremented. Required in this mode.
     pub path: Option<PathBuf>,
 
     /// Project title used in the spec's top-level heading.
@@ -256,6 +268,41 @@ pub struct ExecArgs {
     /// disable the cycle entirely (single review, no fix pass).
     #[arg(long)]
     pub max_review_passes: Option<u32>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SpecFromFollowupsArgs {
+    /// Slug for the new spec (`specs/NNN-<slug>.md`).
+    pub name: String,
+
+    /// Path to the follow-ups file. Defaults to the most recently modified
+    /// file in `.printer/followups/` of the cwd.
+    #[arg(long)]
+    pub from: Option<PathBuf>,
+
+    /// Which agent to drive.
+    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    pub agent: AgentKind,
+
+    /// Override the model.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Working directory for the child agent process.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Permission mode passed to the child agent.
+    #[arg(long, default_value = "bypassPermissions")]
+    pub permission_mode: String,
+
+    /// Show a live spinner / heartbeats during the turn.
+    #[arg(long, short, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Overwrite the destination spec if it already exists.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]

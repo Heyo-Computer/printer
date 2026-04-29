@@ -115,14 +115,24 @@ printer run hello.md
 ### 0. Start a new spec from a template
 
 ```sh
-printer init                       # writes ./spec.md
+printer init                       # fresh repo: writes ./spec.md
 printer init plans/auth.md -t "Auth refactor"
+printer init feat-deploy-assets    # initialized repo: writes specs/NNN-feat-deploy-assets.md
 ```
 
 `init` writes a starter spec in the canonical format (heading, preamble,
 example checklist items, an HTML-comment cheatsheet for the format). Refuses
 to overwrite an existing file unless you pass `--force`. Parent directories
 are created if missing.
+
+The argument is interpreted based on the repo state:
+
+- **Fresh repo** (no `.printer/` yet): treated as a path. Defaults to
+  `spec.md`.
+- **Initialized repo** (`.printer/` already present from a prior run):
+  treated as a slug, and the spec is written to `specs/NNN-<slug>.md` with
+  `NNN` auto-incremented past the highest existing numbered spec. The slug
+  is required in this mode.
 
 ### 1. Run with a non-trivial spec in another directory
 

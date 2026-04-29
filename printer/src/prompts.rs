@@ -168,6 +168,52 @@ same turn.\n\
     )
 }
 
+/// One-turn prompt for `printer spec-from-followups`. The agent reads a
+/// follow-ups dump (verbatim block included) and writes a fresh canonical
+/// spec to `out_path`. It does NOT execute any of the work and does NOT edit
+/// any other files.
+pub fn spec_from_followups_prompt(out_path: &str, followups: &str) -> String {
+    format!(
+        "You are converting a previously-saved review follow-ups file into a new printer \
+spec. Your only task is to write a clean markdown spec at `{out}` and then stop. Do NOT \
+edit any other file, run any builds, or execute any of the work described.\n\
+\n\
+The canonical printer spec format is:\n\
+\n\
+  # <Project / change title>\n\
+\n\
+  A short paragraph (1–3 sentences) describing what this spec is and why it exists.\n\
+\n\
+  ## Tasks\n\
+\n\
+  - [ ] First task — short imperative title for one unit of work\n\
+    Optional 2-space-indented description, multi-line allowed.\n\
+\n\
+  - [ ] Second task — …\n\
+\n\
+Rules for writing the new spec:\n\
+- Each follow-up bullet that represents real work becomes one `- [ ]` task.\n\
+- Skip bullets explicitly marked out-of-scope or that duplicate work.\n\
+- Group related follow-ups into one task only when they truly are one unit of work; \
+otherwise keep them separate.\n\
+- Titles should be short and imperative (\"add X\", \"fix Y\", \"refactor Z\").\n\
+- Add a 2-space-indented description under any task that needs more context than its title.\n\
+- Do NOT carry over status markers from the source — every new task is `- [ ]`.\n\
+- Preserve any concrete file paths or function names from the follow-ups in the \
+descriptions so the next agent has them.\n\
+\n\
+After writing the file, output the literal sentinel {plan_ready} on its own line and stop. \
+Be terse — no preamble, no recap.\n\
+\n\
+--- BEGIN FOLLOW-UPS ---\n\
+{body}\n\
+--- END FOLLOW-UPS ---\n",
+        out = out_path,
+        body = followups.trim(),
+        plan_ready = SENTINEL_PLAN_READY,
+    )
+}
+
 /// Per-turn nudge: the agent uses `printer task` to manage its work queue.
 /// `extra_block` is appended verbatim before the skill list (used for
 /// hook-contributed instructions); `skills` are rendered as a reference list.

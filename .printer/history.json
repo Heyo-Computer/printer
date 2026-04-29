@@ -6,6 +6,13 @@
       "started_at": "2026-04-29T02:48:47.189946957Z",
       "updated_at": "2026-04-29T02:59:09.036809902Z",
       "archived_at": "2026-04-29T03:20:03.464826408Z"
+    },
+    {
+      "spec": "/home/sarocu/Projects/printer/specs/002-planning-stages.md",
+      "phase": "done",
+      "started_at": "2026-04-29T03:20:03.464902752Z",
+      "updated_at": "2026-04-29T03:26:07.591793090Z",
+      "archived_at": "2026-04-29T03:38:33.397244520Z"
     }
   ]
 }
