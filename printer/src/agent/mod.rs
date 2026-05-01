@@ -1,5 +1,8 @@
+pub mod acp;
+
 use crate::cli::AgentKind;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 use tokio::process::Command;
@@ -91,23 +94,40 @@ pub struct AgentInvocation<'a> {
     /// for `{child}` in this template, then run via `sh -c`. Used by the
     /// sandbox driver to dispatch the agent inside a VM (see `drivers.rs`).
     pub command_wrapper: Option<&'a str>,
+    /// Launch command for an ACP agent server. Required when `kind` is
+    /// `AgentKind::Acp`. Ignored for one-shot backends. When the user picks
+    /// a plugin-contributed agent (`--agent acp:<name>`) the call site
+    /// resolves the name to a command via `crate::agents::AgentSet` before
+    /// constructing this struct, so the ACP transport stays plugin-agnostic.
+    pub acp_bin: Option<&'a str>,
+    /// Extra args appended to the ACP server invocation.
+    pub acp_args: &'a [String],
+    /// Environment to pass to the spawned ACP server child. Empty for the
+    /// one-shot backends.
+    pub acp_env: &'a BTreeMap<String, String>,
 }
 
 impl<'a> AgentInvocation<'a> {
     /// Build a fresh-session command (sets the session id).
     pub fn bootstrap(&self, session_id: &Uuid, prompt: &str) -> Command {
-        let argv = match self.kind {
+        let argv = match &self.kind {
             AgentKind::Claude => self.claude_argv(Some(session_id), None, prompt),
             AgentKind::Opencode => self.opencode_argv(Some(session_id), false, prompt),
+            AgentKind::Acp { .. } => panic!(
+                "AgentInvocation::bootstrap() must not be called for ACP agents; use the ACP path in Session::turn"
+            ),
         };
         self.build_command(argv)
     }
 
     /// Build a resume-session command.
     pub fn resume(&self, session_id: &Uuid, prompt: &str) -> Command {
-        let argv = match self.kind {
+        let argv = match &self.kind {
             AgentKind::Claude => self.claude_argv(None, Some(session_id), prompt),
             AgentKind::Opencode => self.opencode_argv(Some(session_id), true, prompt),
+            AgentKind::Acp { .. } => panic!(
+                "AgentInvocation::resume() must not be called for ACP agents; use the ACP path in Session::turn"
+            ),
         };
         self.build_command(argv)
     }
@@ -180,9 +200,10 @@ impl<'a> AgentInvocation<'a> {
 
     /// Parse stdout from a completed agent process into a normalized outcome.
     pub fn parse_outcome(&self, stdout: String, fallback_session: &Uuid) -> anyhow::Result<TurnOutcome> {
-        match self.kind {
+        match &self.kind {
             AgentKind::Claude => parse_claude(stdout, fallback_session),
             AgentKind::Opencode => parse_opencode(stdout, fallback_session),
+            AgentKind::Acp { .. } => parse_opencode(stdout, fallback_session),
         }
     }
 }

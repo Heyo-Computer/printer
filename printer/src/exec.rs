@@ -489,7 +489,7 @@ fn write_phase(cp_path: &Path, spec: &Path, phase: Phase) -> Result<()> {
 fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
     RunArgs {
         spec: spec.to_path_buf(),
-        agent: args.agent,
+        agent: args.agent.clone(),
         model: args.model.clone(),
         max_turns: args.max_turns,
         compact_at: args.compact_at,
@@ -506,13 +506,15 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         // explicitly via run_with_sandbox; the inner run must not create its
         // own.
         no_sandbox: true,
+        acp_bin: args.acp_bin.clone(),
+        acp_args: args.acp_args.clone(),
     }
 }
 
 fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
     ReviewArgs {
         spec: spec.to_path_buf(),
-        agent: args.agent,
+        agent: args.agent.clone(),
         model: args.model.clone(),
         base: args.base.clone(),
         cwd: args.cwd.clone(),
@@ -521,6 +523,8 @@ fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
         skills: args.skills.clone(),
         verbose: args.verbose,
         no_sandbox: true,
+        acp_bin: args.acp_bin.clone(),
+        acp_args: args.acp_args.clone(),
     }
 }
 

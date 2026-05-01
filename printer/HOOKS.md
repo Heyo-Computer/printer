@@ -234,29 +234,38 @@ kind = "vm"
 
 # Provision the sandbox. Must print the handle (id / name / path) on stdout —
 # printer captures stdout and stores it as `{handle}` for subsequent steps.
-create = "heyvm worktree create --base ubuntu-22.04 --name printer-{spec}"
+# heyvm's normal output is multi-line, so we redirect it to stderr and echo
+# the deterministic slug ourselves.
+create = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
 
 # Wrap each child agent invocation. The `{child}` placeholder is required;
-# printer shell-quotes the agent's argv and substitutes it in. Anything else
-# in this template runs verbatim under `sh -c`.
-enter = "heyvm worktree exec {handle} -- {child}"
+# printer shell-quotes the agent's argv token-by-token and substitutes it
+# in. The whole template runs under printer's outer `sh -c`, which parses
+# those tokens back into argv. **Do not add another `sh -c` around
+# `{child}`** — that would double-shell and pass the agent's flags as
+# positional parameters to the inner sh instead of to the agent. `--session
+# printer` keeps cwd and exported env consistent across consecutive
+# `enter` calls.
+enter = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
 
-# (Optional) Push host cwd into the sandbox before the agent runs.
-sync_in = "heyvm worktree push {handle} {cwd}"
-
-# (Optional) Pull artifacts back to the host after the agent finishes.
-sync_out = "heyvm worktree pull {handle} {cwd}"
+# (Optional) sync_in / sync_out push/pull the host cwd to/from the sandbox.
+# The bundled heyvm plugin omits both because cwd is bind-mounted via
+# `--mount` at create time, so file edits round-trip live and there is
+# nothing to copy. Drivers backed by transports that *do* need an explicit
+# copy step (e.g. an SSH-only remote) would set them.
 
 # (Optional) Tear the sandbox down. Runs from `Drop`, so it fires on panic
 # and on early returns too. Failures are logged and swallowed — sync_out and
 # destroy are best-effort cleanup.
-destroy = "heyvm worktree destroy {handle}"
+destroy = "heyvm delete -y {handle}"
 
 # (Optional) Preflight script run *inside* the sandbox right after `create`
 # succeeds. printer wraps it through `enter` automatically. Failure here
 # tears the sandbox down and aborts the run; use shell short-circuits
-# (`|| true`) if you want a step to be best-effort.
-post_create = "bash -lc 'cargo fetch || true'"
+# (`|| true`) if you want a step to be best-effort. The bundled heyvm
+# manifest uses this to `cd /workspace` once so subsequent `enter` calls
+# inherit cwd via the persistent `--session`.
+post_create = "cd /workspace"
 ```
 
 ### Lifecycle
@@ -305,8 +314,10 @@ to print the resolved values, and `printer config edit` to open the file in
 #   "<plugin-name>" — pick a specific driver by plugin name.
 driver = "auto"
 
-# Forwarded to the driver's templates as {base_image}.
-base_image = "heyvm:ubuntu-22.04"
+# Forwarded to the driver's templates as {base_image}. For the bundled heyvm
+# plugin this is the image string passed to `heyvm create --image …` (e.g.
+# "ubuntu:24.04", "alpine:3.19", or any image heyvm knows about).
+base_image = "ubuntu:24.04"
 
 # Names of env vars to forward into the sandbox. Driver-specific.
 env = []
@@ -318,11 +329,11 @@ mounts = []
 # here replaces that step's template; anything you omit falls through to the
 # plugin's default. Same `{var}` interpolation as the plugin's [driver] block.
 [sandbox.commands]
-# create  = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
-# enter   = "heyvm worktree exec {handle} -- {child}"
-# destroy = "heyvm worktree destroy {handle}"
-# sync_in  = "heyvm worktree push {handle} {cwd}"
-# sync_out = "heyvm worktree pull {handle} {cwd}"
+# create  = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
+# enter   = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
+# destroy = "heyvm delete -y {handle}"
+# sync_in / sync_out are unset for the heyvm driver: cwd is bind-mounted at
+# create time, so file edits round-trip live.
 
 # Optional preflight inside the sandbox, run right after `create`. Wrapped via
 # `enter`. Failure aborts the run; use shell short-circuits to make a step
@@ -336,6 +347,88 @@ spec is re-validated — so a config typo (`enter` missing `{child}`, an empty
 
 `--no-sandbox` on the CLI is equivalent to `sandbox.driver = "off"` for the
 duration of one command.
+
+## ACP agents
+
+`printer run` / `review` / `exec` / `plan` / `spec-from-followups` accept
+`--agent acp` alongside the existing `claude` and `opencode` choices. ACP is
+the [Agent Client Protocol](https://agentclientprotocol.com) — a long-lived
+JSON-RPC 2.0 stdio transport spoken by agents like `claude-code-acp` and
+Poolside, where one process serves the whole printer session instead of being
+re-spawned per turn.
+
+### Selecting an ACP server
+
+Two ways to point printer at the server binary:
+
+1. **Inline flags** — pass `--acp-bin <command>` (and optionally repeated
+   `--acp-arg <arg>` to append extra argv tokens):
+
+   ```
+   printer run spec.md --agent acp --acp-bin claude-code-acp
+   ```
+
+2. **Plugin-contributed agent** — an installed plugin may declare one or
+   more `[[agent]]` blocks that name a launch command. Pick one by name:
+
+   ```
+   printer run spec.md --agent acp:poolside
+   ```
+
+   `--acp-bin` (if also passed) overrides the manifest's `command`;
+   `--acp-arg` tokens are appended after the manifest's `args`.
+
+#### Plugin manifest schema
+
+Inside a plugin manifest (or the `printer-plugin.toml` shipped at the source
+root) declare one block per agent:
+
+```toml
+[[agent]]
+kind = "acp"
+# Lookup name. Must be unique across every installed plugin's manifests.
+# Reserved names (`claude`, `opencode`, `acp`) are refused at install time
+# because they would shadow the built-in --agent choices.
+name = "poolside"
+# Launch command (binary on $PATH, or absolute path). Required.
+command = "poolside"
+# Argv tokens appended to `command`. Optional.
+args = ["acp"]
+# Env vars passed to the spawned child. Values are taken as literal strings
+# — no shell expansion. Optional.
+env = { POOLSIDE_LOG = "info" }
+```
+
+`printer plugins` shows `agent` in the `ROLES` column for any plugin that
+contributes at least one `[[agent]]` block.
+
+#### Worked example: bundled `plugins/poolside/`
+
+The repo ships a reference ACP plugin at `plugins/poolside/`. Its
+`printer-plugin.toml` is exactly the schema above — `command = "poolside"`,
+`args = ["acp"]`, plus a `before_run` agent skill (`skills/poolside/`)
+that briefs the implementer to follow host-repo conventions instead of
+imposing Poolside defaults. Install it with
+`printer add-plugin path:plugins/poolside` and dispatch with
+`printer run --agent acp:poolside <spec>`. See
+`plugins/poolside/README.md` for the full install/use story and
+prerequisites (the `poolside` CLI must be on `$PATH`).
+
+### Sandbox interaction
+
+If a sandbox driver is active, the same `enter = "... {child}"` template that
+wraps one-shot agents also wraps the ACP server launch — the long-lived child
+runs inside the sandbox just like a per-turn child would. Skip with
+`--no-sandbox` for host-side debugging.
+
+### What's wired in this release
+
+T-017 ships the **blocking-turn** transport: `initialize` → `session/new` →
+`session/prompt` per turn, with all `session/update` text content blocks
+concatenated into the agent's reply. Token usage is not yet surfaced (ACP
+doesn't standardize a usage shape) so the compaction-by-rotation trigger will
+not fire mid-session. Streaming-to-stderr, Ctrl-C cancellation via
+`session/cancel`, and permission-mode mapping are tracked on T-020.
 
 ## Backwards compatibility
 

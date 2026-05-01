@@ -43,12 +43,20 @@ pub async fn plan(args: PlanArgs) -> Result<TokenUsage> {
         report.created, report.existing, report.closed
     );
 
+    let acp = crate::agents::resolve_acp_launch(
+        &args.agent,
+        args.acp_bin.as_deref(),
+        &args.acp_args,
+    )?;
     let agent = AgentInvocation {
-        kind: args.agent,
+        kind: args.agent.clone(),
         model: args.model.as_deref(),
         cwd: Some(&cwd),
         permission_mode: &args.permission_mode,
         command_wrapper: None,
+        acp_bin: acp.bin.as_deref(),
+        acp_args: acp.args.as_slice(),
+        acp_env: &acp.env,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 

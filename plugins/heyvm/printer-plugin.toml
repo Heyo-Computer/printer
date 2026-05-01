@@ -3,7 +3,7 @@
 # Skill-only / driver-only plugin: heyvm itself is an external CLI shipped from
 # https://docs.heyo.computer, so there is no Cargo crate here. Installing this
 # plugin registers a sandbox driver that dispatches every agent turn through
-# `heyvm worktree`, plus a before_run skill so the agent understands it is
+# `heyvm exec`, plus a before_run skill so the agent understands it is
 # running inside a worktree.
 #
 # Prereq: the `heyvm` binary must be on $PATH. See README.md.
@@ -15,20 +15,53 @@ assets = ["skills"]
 [driver]
 kind = "vm"
 
-# `heyvm worktree create` must print the new worktree handle (id / name) on
-# stdout — printer captures stdout and stores it as `{handle}`. If a future
-# heyvm release prints human prose instead, wrap with
-# `sh -c 'heyvm worktree create … | tail -n1'`.
-create = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
+# Provision a sandbox with the host cwd bind-mounted at /workspace. heyvm's
+# normal create output is multi-line and would corrupt the captured handle,
+# so we redirect heyvm's stdout to stderr (still visible to the user) and
+# echo the deterministic slug — that's the {handle} for every later step.
+#
+# Mounts:
+#   {cwd}:/workspace            — the host repo, RW. The agent's cwd.
+#   $HOME/.claude:$HOME/.claude — claude code's state dir, RW. Without
+#       this, heyvm's bubblewrap default exposes $HOME read-only, which
+#       makes every claude `Bash` tool call fail to mkdir
+#       ~/.claude/session-env/<uuid>, and breaks session resume across
+#       printer's rotation boundary (claude's per-session jsonl can't
+#       persist). Bind-mounting RW lets claude reuse host credentials and
+#       write session state. The sandbox can mutate host ~/.claude; for
+#       stricter isolation override `enter` to set HOME to an in-sandbox
+#       writable path and copy credentials in via `post_create`.
+#   $HOME is expanded by the outer printer `sh -c`, so different host
+#   users Just Work.
+#
+# `--needs-network` is required for agents that hit external APIs (claude
+# code / codex). `--no-ttl` keeps the sandbox alive for the full exec.
+create = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
 
-# `{child}` is shell-quoted by printer (drivers.rs::shell_quote), so wrapping
-# it in `sh -c` is the right form: heyvm execs `sh -c '<quoted argv>'` inside
-# the worktree.
-enter = "heyvm worktree exec {handle} -- sh -c {child}"
+# After create succeeds, set cwd to the bind-mount once. We use a persistent
+# heyvm session ("printer") that retains cwd across exec calls, so every
+# subsequent `enter` inherits /workspace as the working directory.
+post_create = "cd /workspace"
 
-sync_in  = "heyvm worktree push {handle} {cwd}"
-sync_out = "heyvm worktree pull {handle} {cwd}"
-destroy  = "heyvm worktree destroy {handle}"
+# `{child}` is the agent's argv, shell-quoted token-by-token by printer
+# (drivers.rs::shell_quote_argv). The outer printer `sh -c` parses those
+# tokens into separate argv elements, which heyvm then passes verbatim to
+# the persistent session shell — so we do *not* wrap with another `sh -c`
+# (that double-shells and mangles the argv). `--session printer` makes cwd
+# and exported env stick across consecutive `heyvm exec` calls; the cwd is
+# set to /workspace once via `post_create` and then inherited by every
+# subsequent agent turn.
+#
+# IS_SANDBOX=1 tells claude code to allow `--dangerously-skip-permissions`
+# even though heyvm sandboxes run as root. Without it, claude refuses with
+# "cannot be used with root/sudo privileges". This is safe here because
+# the sandbox itself provides the isolation that bypassPermissions would
+# otherwise compromise on the host.
+enter = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
+
+# Bind mount means file edits round-trip live — no separate push/pull.
+
+destroy = "heyvm delete -y {handle}"
 
 # --- Agent skill ----------------------------------------------------------
 

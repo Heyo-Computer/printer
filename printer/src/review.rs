@@ -204,12 +204,20 @@ pub async fn review_with_sandbox(
         );
     }
     let wrapper = sandbox.map(|s| s.enter_template());
+    let acp = crate::agents::resolve_acp_launch(
+        &args.agent,
+        args.acp_bin.as_deref(),
+        &args.acp_args,
+    )?;
     let agent = AgentInvocation {
-        kind: args.agent,
+        kind: args.agent.clone(),
         model: args.model.as_deref(),
         cwd: cwd_ref,
         permission_mode: &args.permission_mode,
         command_wrapper: wrapper.as_deref(),
+        acp_bin: acp.bin.as_deref(),
+        acp_args: acp.args.as_slice(),
+        acp_env: &acp.env,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 

@@ -18,6 +18,9 @@ pub struct Manifest {
     /// Sandbox/VM driver the plugin contributes (optional). See `HOOKS.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<crate::drivers::DriverSpec>,
+    /// ACP agents the plugin contributes (optional). See `HOOKS.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<crate::agents::AgentSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +238,9 @@ pub fn list_installed() -> Result<()> {
         }
         if m.driver.is_some() {
             roles.push("driver");
+        }
+        if !m.agents.is_empty() {
+            roles.push("agent");
         }
         let role_str = if roles.is_empty() {
             "—".to_string()

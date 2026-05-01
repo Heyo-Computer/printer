@@ -1,4 +1,5 @@
 mod agent;
+mod agents;
 mod cli;
 mod codegraph_watch;
 mod config;

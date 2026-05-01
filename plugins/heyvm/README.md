@@ -75,47 +75,66 @@ is the only thing that lands), but the next `printer exec` will fail at
 ## What it does
 
 - `[driver]` — `printer exec` runs every agent invocation as
-  `heyvm worktree exec <handle> -- sh -c '<quoted argv>'`. The worktree is
-  created at the top of `exec`, host cwd is pushed in via
-  `heyvm worktree push`, and the worktree is destroyed when `exec` finishes
-  (or early-returns / panics — `destroy` runs from `Drop`).
+  `heyvm exec <handle> --session printer --env IS_SANDBOX=1 -- <agent argv>`
+  (no extra `sh -c` layer; heyvm passes argv verbatim into the session
+  shell). A heyvm sandbox is created at the top of `exec` with host cwd
+  bind-mounted at `/workspace`, and is destroyed when `exec` finishes (or
+  early-returns / panics — `destroy` runs from `Drop`). The `IS_SANDBOX=1`
+  env tells claude code to allow `--dangerously-skip-permissions` under
+  the sandbox's root user.
 - `before_run` skill — registers `skills/heyvm-sandbox/SKILL.md` so the
-  implementer agent understands cwd is mounted from the host while
-  everything else is ephemeral.
+  implementer agent understands `/workspace` is bind-mounted from the host
+  while everything else is ephemeral.
 
 ## Lifecycle of one `printer exec`
 
 A single sandbox spans both run and review phases (provisioned in
 `exec.rs::acquire_exec_sandbox`). The lifecycle is:
 
-1. **`create`** — `heyvm worktree create --base {base_image} --name printer-{spec_slug}`.
-   Stdout is captured as the opaque worktree `{handle}` and reused by every
-   later step.
-2. **`sync_in`** — `heyvm worktree push {handle} {cwd}`. Host cwd is
-   copied **into** the worktree before any agent runs.
+1. **`create`** — `heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude`.
+   The host cwd is bind-mounted into the sandbox at `/workspace`, and
+   the host's `~/.claude` is bind-mounted RW at the same path inside the
+   sandbox so claude code can persist its session state and reuse host
+   credentials. We redirect heyvm's normal multi-line output to stderr
+   and `echo` the deterministic slug, so printer captures
+   `printer-{spec_slug}` as `{handle}`. The `~/.claude` mount **does**
+   share state with the host: the sandbox can mutate your local claude
+   credentials/conversations. Override `[sandbox.commands] create` to
+   drop the mount if you need stricter isolation (and pair it with a
+   `post_create` that copies a credential file into a sandbox-local HOME).
+2. **`post_create`** — `cd /workspace`, wrapped through `enter` so it runs
+   inside the sandbox. The persistent heyvm session named `printer` retains
+   cwd across subsequent exec calls.
 3. **Each agent turn** — both the implementer (`run`) and the reviewer
-   (`review`) are wrapped via `enter`: `heyvm worktree exec {handle} -- sh -c {child}`.
-   File edits happen on the worktree's copy of cwd, not the host's.
-4. **`sync_out`** — `heyvm worktree pull {handle} {cwd}`. The worktree's
-   cwd is copied **back over** the host cwd. Best-effort: failures are
-   logged and swallowed so a flaky pull can't strand a finished run.
-5. **`destroy`** — `heyvm worktree destroy {handle}`. Runs from `Drop`,
-   so it fires on panic, early return, or Ctrl-C.
+   (`review`) are wrapped via `enter`:
+   `heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}`.
+   The agent's argv reaches the session shell with quoting preserved (no
+   extra `sh -c` layer). File edits happen at `/workspace` inside the
+   sandbox, which is the same inode as the host cwd thanks to the bind
+   mount. `IS_SANDBOX=1` is a documented opt-in that claude code reads to
+   allow its bypass-permissions mode under root — without it claude
+   exits early with a safety check.
+4. **`destroy`** — `heyvm delete -y {handle}`. Runs from `Drop`, so it
+   fires on panic, early return, or Ctrl-C.
 
-### Files are *replaced*, not git-merged
+`sync_in` and `sync_out` are intentionally not set: the bind mount means
+host and sandbox share the same files, so there is nothing to copy.
 
-`sync_out` is a `heyvm worktree pull` — a file-tree copy from the worktree
-back to the host. There is no `git merge`, no rebase, and no three-way
-reconciliation. If the host cwd was modified in parallel while exec was
-running, those host changes will be clobbered by whatever the worktree
-produced. Treat the host cwd as locked for the duration of `printer exec`.
+### Files round-trip live (no git merge, no copy)
 
-Only `{cwd}` round-trips. Anything the agent installed outside cwd
-(`~/.cache/`, `/tmp/`, system packages) is discarded with the worktree —
-durable tooling belongs in `sandbox.base_image`.
+Because cwd is bind-mounted, every write the agent makes lands directly on
+the host's filesystem. There is no `sync_out` step copying things back, and
+no `git merge` either. Treat the host cwd as actively-mutated for the
+duration of `printer exec` — editing the same files from another process
+will race the agent.
 
-To inspect the result without auto-pulling, run with `--keep-sandbox` (when
-exposed) or override `sync_out`/`destroy` to no-ops in `[sandbox.commands]`.
+Only `/workspace` (i.e. `{cwd}`) is shared. Anything the agent installed
+outside cwd (`~/.cache/`, `/tmp/`, system packages) lives in the sandbox's
+upper layer and is discarded with the sandbox — durable tooling belongs in
+`sandbox.base_image`.
+
+To inspect the sandbox after the run finishes, override `destroy` to a no-op
+in `[sandbox.commands]` and use `heyvm sh <handle>` to attach a shell.
 
 ## Configuration
 
@@ -124,12 +143,13 @@ Override any driver step in `~/.printer/config.toml`:
 ```toml
 [sandbox]
 driver = "heyvm"             # or "auto" if heyvm is the only installed driver
-base_image = "heyvm:ubuntu-22.04"
+base_image = "ubuntu:24.04"  # passed to `heyvm create --image …`
 
 [sandbox.commands]
-# create  = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
-# enter   = "heyvm worktree exec {handle} -- sh -c {child}"
-# destroy = "heyvm worktree destroy {handle}"
+# create  = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace >&2 && echo printer-{spec_slug}"
+# enter   = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
+# destroy = "heyvm delete -y {handle}"
+# post_create = "cd /workspace"
 ```
 
 See `printer/HOOKS.md` ("Sandbox drivers" + "Global config") for the full

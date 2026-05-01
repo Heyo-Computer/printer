@@ -1,4 +1,6 @@
+use crate::agent::acp::AcpClient;
 use crate::agent::{AgentInvocation, TokenUsage, TurnOutcome};
+use crate::cli::AgentKind;
 use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::process::Stdio;
@@ -20,6 +22,8 @@ pub struct Session<'a> {
     pub agent: AgentInvocation<'a>,
     pub verbose: bool,
     fresh: bool,
+    acp: Option<AcpClient>,
+    acp_session_id: Option<String>,
 }
 
 impl<'a> Session<'a> {
@@ -32,6 +36,8 @@ impl<'a> Session<'a> {
             agent,
             verbose: false,
             fresh: true,
+            acp: None,
+            acp_session_id: None,
         }
     }
 
@@ -46,9 +52,17 @@ impl<'a> Session<'a> {
         self.id = Uuid::new_v4();
         self.fresh = true;
         self.cumulative_input_tokens = 0;
+        // For ACP, drop the existing client so the next turn re-spawns the
+        // server and starts a fresh `session/new`. Mirrors what one-shot
+        // backends do implicitly by spawning a new process per turn.
+        self.acp = None;
+        self.acp_session_id = None;
     }
 
     pub async fn turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
+        if matches!(self.agent.kind, AgentKind::Acp { .. }) {
+            return self.turn_acp(prompt).await;
+        }
         let mut cmd = if self.fresh {
             self.agent.bootstrap(&self.id, prompt)
         } else {
@@ -179,6 +193,63 @@ impl<'a> Session<'a> {
         );
         // Subsequent turns resume the same session id (claude requires a new
         // uuid for --session-id, so we keep using --resume from now on).
+        self.fresh = false;
+        Ok(outcome)
+    }
+
+    /// ACP-backed turn. Lazily spawns the long-lived server on the first call
+    /// (and again after `rotate()`), then sends one blocking `session/prompt`.
+    /// Token usage is not surfaced (T-020 follow-up).
+    async fn turn_acp(&mut self, prompt: &str) -> Result<TurnOutcome> {
+        let started = Instant::now();
+        eprintln!(
+            "[printer] turn {} starting (acp session {}{})",
+            self.turn_count + 1,
+            short(&self.id),
+            if self.fresh { ", fresh" } else { ", resumed" }
+        );
+
+        if self.acp.is_none() {
+            let bin = self.agent.acp_bin.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--agent acp requires --acp-bin <command> (or pick a plugin-contributed agent via --agent acp:<name>)"
+                )
+            })?;
+            let client = AcpClient::spawn(
+                bin,
+                self.agent.acp_args,
+                self.agent.cwd,
+                self.agent.command_wrapper,
+                self.agent.acp_env,
+            )
+            .await
+            .context("spawning ACP server")?;
+            client.initialize().await.context("ACP initialize failed")?;
+            let cwd = self
+                .agent
+                .cwd
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let session_id = client
+                .session_new(&cwd)
+                .await
+                .context("ACP session/new failed")?;
+            eprintln!("[printer] acp server up; session/new id={session_id}");
+            self.acp = Some(client);
+            self.acp_session_id = Some(session_id);
+        }
+
+        let session_id = self.acp_session_id.clone().expect("acp session id set");
+        let client = self.acp.as_ref().expect("acp client set");
+        let outcome = client.prompt_blocking(&session_id, prompt).await?;
+
+        self.turn_count += 1;
+        self.usage_total.add(&outcome.usage);
+        eprintln!(
+            "[printer] turn {} done in {:.1}s (acp; usage not surfaced — see T-020)",
+            self.turn_count,
+            started.elapsed().as_secs_f32(),
+        );
         self.fresh = false;
         Ok(outcome)
     }

@@ -2,7 +2,11 @@
 //! hooks and asset files to merge into the installed manifest. See
 //! `printer/HOOKS.md` ("Authoring a plugin").
 
-use crate::{drivers::{DriverSpec, validate_driver}, hooks::{HookSpec, resolve_hook}};
+use crate::{
+    agents::{AgentSpec, validate_agent},
+    drivers::{DriverSpec, validate_driver},
+    hooks::{HookSpec, resolve_hook},
+};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs;
@@ -18,6 +22,8 @@ pub struct SourceManifest {
     pub assets: Vec<String>,
     #[serde(default)]
     pub driver: Option<DriverSpec>,
+    #[serde(default, rename = "agent")]
+    pub agents: Vec<AgentSpec>,
 }
 
 impl SourceManifest {
@@ -56,6 +62,25 @@ impl SourceManifest {
         validate_driver(spec)
             .with_context(|| format!("{FILE_NAME} [driver] block"))?;
         Ok(Some(spec.clone()))
+    }
+
+    /// Validate every declared `[[agent]]` block and check that names are
+    /// unique within this manifest. Cross-plugin uniqueness is enforced at
+    /// load time by `AgentSet::load_installed`.
+    pub fn validate_agents(&self) -> Result<Vec<AgentSpec>> {
+        let mut out = Vec::with_capacity(self.agents.len());
+        for (i, spec) in self.agents.iter().enumerate() {
+            validate_agent(spec)
+                .with_context(|| format!("{FILE_NAME} [[agent]] #{}", i + 1))?;
+            if out.iter().any(|s: &AgentSpec| s.name == spec.name) {
+                bail!(
+                    "{FILE_NAME} declares two [[agent]] blocks with name `{}`",
+                    spec.name
+                );
+            }
+            out.push(spec.clone());
+        }
+        Ok(out)
     }
 }
 
@@ -244,6 +269,73 @@ on_failure = "warn"
         fs::write(dst.path().join("a.md"), b"already").unwrap();
         let err = copy_assets(src.path(), dst.path(), &["a.md".to_string()]).unwrap_err();
         assert!(err.to_string().contains("collides"));
+    }
+
+    #[test]
+    fn loads_and_validates_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"
+[[agent]]
+kind = "acp"
+name = "poolside"
+command = "poolside"
+args = ["acp"]
+
+[[agent]]
+kind = "acp"
+name = "claude-code"
+command = "claude-code-acp"
+"#,
+        )
+        .unwrap();
+        let m = SourceManifest::load(dir.path()).unwrap();
+        let validated = m.validate_agents().unwrap();
+        assert_eq!(validated.len(), 2);
+        assert_eq!(validated[0].name, "poolside");
+        assert_eq!(validated[1].command, "claude-code-acp");
+    }
+
+    #[test]
+    fn validate_agents_rejects_dupes_in_same_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"
+[[agent]]
+kind = "acp"
+name = "dup"
+command = "x"
+
+[[agent]]
+kind = "acp"
+name = "dup"
+command = "y"
+"#,
+        )
+        .unwrap();
+        let m = SourceManifest::load(dir.path()).unwrap();
+        let err = m.validate_agents().unwrap_err();
+        assert!(err.to_string().contains("dup"));
+    }
+
+    #[test]
+    fn validate_agents_rejects_reserved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"
+[[agent]]
+kind = "acp"
+name = "claude"
+command = "x"
+"#,
+        )
+        .unwrap();
+        let m = SourceManifest::load(dir.path()).unwrap();
+        let err = m.validate_agents().unwrap_err();
+        assert!(format!("{err:#}").contains("reserved"));
     }
 
     #[test]

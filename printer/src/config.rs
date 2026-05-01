@@ -28,8 +28,10 @@ pub const DEFAULT_CONFIG: &str = r#"# printer global config (~/.printer/config.t
 #   "<plugin-name>" — pick a specific driver by plugin name.
 driver = "auto"
 
-# Forwarded to the driver's templates as {base_image}.
-base_image = "heyvm:ubuntu-22.04"
+# Forwarded to the driver's templates as {base_image}. For the heyvm plugin
+# this is the image string passed to `heyvm create --image …` (e.g.
+# "ubuntu:24.04", "alpine:3.19", or any image heyvm knows about).
+base_image = "ubuntu:24.04"
 
 # Names of env vars to forward into the sandbox. Driver-specific.
 env = []
@@ -42,11 +44,11 @@ mounts = []
 # plugin's defaults. Same {var} interpolation as the plugin manifest, plus
 # {base_image} (from above) and {spec_slug} (the spec basename, sanitized).
 [sandbox.commands]
-# create = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
-# enter = "heyvm worktree exec {handle} -- {child}"
-# destroy = "heyvm worktree destroy {handle}"
-# sync_in = "heyvm worktree push {handle} {cwd}"
-# sync_out = "heyvm worktree pull {handle} {cwd}"
+# create = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
+# enter = "heyvm exec {handle} --session printer --env IS_SANDBOX=1 -- {child}"
+# destroy = "heyvm delete -y {handle}"
+# sync_in / sync_out are not used: cwd is bind-mounted, so file edits
+# round-trip live and there's nothing to copy.
 
 # Optional preflight script. Wrapped through `enter` so it runs inside the
 # sandbox right after create. Failure aborts the run.
@@ -112,7 +114,7 @@ pub struct SandboxCommands {
 }
 
 fn default_base_image() -> String {
-    "heyvm:ubuntu-22.04".to_string()
+    "ubuntu:24.04".to_string()
 }
 
 /// What the user wants `pick_active` to return.
@@ -225,7 +227,7 @@ mod tests {
         let d = tmp();
         let cfg = load_from(&d.path().join("nope.toml")).unwrap();
         assert_eq!(cfg.sandbox.driver, SandboxDriverChoice::Auto);
-        assert_eq!(cfg.sandbox.base_image, "heyvm:ubuntu-22.04");
+        assert_eq!(cfg.sandbox.base_image, "ubuntu:24.04");
         assert!(cfg.sandbox.env.is_empty());
         assert!(cfg.sandbox.mounts.is_empty());
     }
@@ -238,7 +240,7 @@ mod tests {
         writeln!(f, "[sandbox]\ndriver = \"off\"").unwrap();
         let cfg = load_from(&p).unwrap();
         assert_eq!(cfg.sandbox.driver, SandboxDriverChoice::Off);
-        assert_eq!(cfg.sandbox.base_image, "heyvm:ubuntu-22.04");
+        assert_eq!(cfg.sandbox.base_image, "ubuntu:24.04");
     }
 
     #[test]
@@ -318,6 +320,6 @@ mod tests {
         fs::write(&p, DEFAULT_CONFIG).unwrap();
         let cfg = load_from(&p).unwrap();
         assert_eq!(cfg.sandbox.driver, SandboxDriverChoice::Auto);
-        assert_eq!(cfg.sandbox.base_image, "heyvm:ubuntu-22.04");
+        assert_eq!(cfg.sandbox.base_image, "ubuntu:24.04");
     }
 }

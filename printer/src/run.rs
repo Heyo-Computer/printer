@@ -168,12 +168,20 @@ async fn run_inner(
         .context("resolving printer binary path for the agent prompt")?;
     let printer_bin_str = printer_bin.to_string_lossy().into_owned();
 
+    let acp = crate::agents::resolve_acp_launch(
+        &args.agent,
+        args.acp_bin.as_deref(),
+        &args.acp_args,
+    )?;
     let agent = AgentInvocation {
-        kind: args.agent,
+        kind: args.agent.clone(),
         model: args.model.as_deref(),
         cwd: Some(cwd),
         permission_mode: &args.permission_mode,
         command_wrapper,
+        acp_bin: acp.bin.as_deref(),
+        acp_args: acp.args.as_slice(),
+        acp_env: &acp.env,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 

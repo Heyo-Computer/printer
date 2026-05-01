@@ -41,15 +41,17 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
     // Read optional `printer-plugin.toml` from the source dir, validate its
     // hooks, and copy any declared asset files alongside the binary so paths
     // referenced by hooks resolve at runtime.
-    let (declared_hooks, declared_assets, declared_driver) = match installed.source_dir.as_deref() {
-        Some(src) => {
-            let sm = SourceManifest::load(src)?;
-            let hooks = sm.validate_hooks(&name, &plugin_dir)?;
-            let driver = sm.validate_driver()?;
-            (hooks, sm.assets, driver)
-        }
-        None => (Vec::new(), Vec::new(), None),
-    };
+    let (declared_hooks, declared_assets, declared_driver, declared_agents) =
+        match installed.source_dir.as_deref() {
+            Some(src) => {
+                let sm = SourceManifest::load(src)?;
+                let hooks = sm.validate_hooks(&name, &plugin_dir)?;
+                let driver = sm.validate_driver()?;
+                let agents = sm.validate_agents()?;
+                (hooks, sm.assets, driver, agents)
+            }
+            None => (Vec::new(), Vec::new(), None, Vec::new()),
+        };
     if let Some(src) = installed.source_dir.as_deref()
         && !declared_assets.is_empty()
     {
@@ -57,6 +59,7 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
     }
     let hook_count = declared_hooks.len();
     let has_driver = declared_driver.is_some();
+    let agent_count = declared_agents.len();
 
     let manifest = Manifest {
         name: name.clone(),
@@ -66,6 +69,7 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         source: installed.source,
         hooks: declared_hooks,
         driver: declared_driver,
+        agents: declared_agents,
     };
     store::write_manifest(&plugin_dir, &manifest)?;
     if hook_count > 0 {
@@ -73,6 +77,9 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
     }
     if has_driver {
         eprintln!("[printer] registered sandbox driver for `{name}`");
+    }
+    if agent_count > 0 {
+        eprintln!("[printer] registered {agent_count} agent(s) for `{name}`");
     }
 
     if manifest.binary.is_empty() {

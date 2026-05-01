@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(name = "printer", about = "Drive a Claude/opencode session against a markdown spec")]
@@ -75,7 +76,7 @@ pub struct RunArgs {
     pub spec: PathBuf,
 
     /// Which agent to drive.
-    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
     pub agent: AgentKind,
 
     /// Override the model (passed through to the agent).
@@ -121,6 +122,17 @@ pub struct RunArgs {
     /// installed plugin contributes one. Useful for debugging on the host.
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
+
+    /// Path/command to launch the ACP agent server. Required with bare
+    /// `--agent acp`; optional with `--agent acp:<name>`, where it overrides
+    /// the binary the plugin's `[[agent]]` block points at.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP server's argv. With
+    /// `--agent acp:<name>` these append to the plugin manifest's `args`.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -129,7 +141,7 @@ pub struct PlanArgs {
     pub spec: PathBuf,
 
     /// Which agent to drive.
-    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
     pub agent: AgentKind,
 
     /// Override the model.
@@ -157,6 +169,14 @@ pub struct PlanArgs {
     /// finalize.
     #[arg(long, default_value_t = 3)]
     pub max_question_rounds: u32,
+
+    /// Path/command to launch the ACP agent server when `--agent acp`.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP agent binary's argv.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -165,7 +185,7 @@ pub struct ReviewArgs {
     pub spec: PathBuf,
 
     /// Which agent to drive.
-    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
     pub agent: AgentKind,
 
     /// Override the model.
@@ -205,6 +225,14 @@ pub struct ReviewArgs {
     /// installed plugin contributes one.
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
+
+    /// Path/command to launch the ACP agent server when `--agent acp`.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP agent binary's argv.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -220,7 +248,7 @@ pub struct ExecArgs {
     pub r#continue: bool,
 
     /// Which agent to drive.
-    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
     pub agent: AgentKind,
 
     /// Override the model (passed through to the agent).
@@ -287,6 +315,14 @@ pub struct ExecArgs {
     /// phases of the exec.
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
+
+    /// Path/command to launch the ACP agent server when `--agent acp`.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP agent binary's argv.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -300,7 +336,7 @@ pub struct SpecFromFollowupsArgs {
     pub from: Option<PathBuf>,
 
     /// Which agent to drive.
-    #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+    #[arg(long, default_value_t = AgentKind::Claude, value_parser = parse_agent_kind)]
     pub agent: AgentKind,
 
     /// Override the model.
@@ -322,6 +358,14 @@ pub struct SpecFromFollowupsArgs {
     /// Overwrite the destination spec if it already exists.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+
+    /// Path/command to launch the ACP agent server when `--agent acp`.
+    #[arg(long)]
+    pub acp_bin: Option<String>,
+
+    /// Repeatable extra arg appended to the ACP agent binary's argv.
+    #[arg(long = "acp-arg", value_name = "ARG")]
+    pub acp_args: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -370,8 +414,118 @@ pub enum ConfigCommand {
     Edit,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// Which agent backend to drive.
+///
+/// CLI form (case-insensitive):
+/// - `claude` → built-in one-shot Claude CLI
+/// - `opencode` → built-in one-shot opencode CLI
+/// - `acp` → ACP server, launched from `--acp-bin` and `--acp-arg`
+/// - `acp:<name>` → ACP server contributed by an installed plugin's
+///   `[[agent]]` block (see HOOKS.md)
+#[derive(Clone, Debug)]
 pub enum AgentKind {
     Claude,
     Opencode,
+    Acp { name: Option<String> },
+}
+
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentKind::Claude => f.write_str("claude"),
+            AgentKind::Opencode => f.write_str("opencode"),
+            AgentKind::Acp { name: None } => f.write_str("acp"),
+            AgentKind::Acp { name: Some(n) } => write!(f, "acp:{n}"),
+        }
+    }
+}
+
+/// Clap value parser. Wraps `AgentKind::from_str` so the `--agent` flag accepts
+/// the same forms (`claude`, `opencode`, `acp`, `acp:<name>`) without needing
+/// a `ValueEnum` derive — `acp:<name>` carries a payload that ValueEnum can't
+/// model.
+fn parse_agent_kind(s: &str) -> Result<AgentKind, String> {
+    AgentKind::from_str(s)
+}
+
+impl FromStr for AgentKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
+            "claude" => Ok(AgentKind::Claude),
+            "opencode" => Ok(AgentKind::Opencode),
+            "acp" => Ok(AgentKind::Acp { name: None }),
+            other => {
+                if let Some(name) = other.strip_prefix("acp:") {
+                    if name.is_empty() {
+                        return Err(
+                            "agent `acp:` requires a plugin-contributed name (e.g. acp:poolside)"
+                                .into(),
+                        );
+                    }
+                    Ok(AgentKind::Acp {
+                        name: Some(name.to_string()),
+                    })
+                } else {
+                    Err(format!(
+                        "unknown agent `{s}` (expected one of: claude, opencode, acp, acp:<name>)"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_builtin_agents() {
+        assert!(matches!(AgentKind::from_str("claude"), Ok(AgentKind::Claude)));
+        assert!(matches!(
+            AgentKind::from_str("opencode"),
+            Ok(AgentKind::Opencode)
+        ));
+        assert!(matches!(
+            AgentKind::from_str("CLAUDE"),
+            Ok(AgentKind::Claude)
+        ));
+    }
+
+    #[test]
+    fn parses_bare_acp() {
+        assert!(matches!(
+            AgentKind::from_str("acp"),
+            Ok(AgentKind::Acp { name: None })
+        ));
+    }
+
+    #[test]
+    fn parses_named_acp() {
+        match AgentKind::from_str("acp:poolside").unwrap() {
+            AgentKind::Acp { name: Some(n) } => assert_eq!(n, "poolside"),
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_acp_name() {
+        let err = AgentKind::from_str("acp:").unwrap_err();
+        assert!(err.contains("requires a plugin-contributed name"));
+    }
+
+    #[test]
+    fn rejects_unknown() {
+        assert!(AgentKind::from_str("banana").is_err());
+    }
+
+    #[test]
+    fn display_round_trips() {
+        for s in ["claude", "opencode", "acp", "acp:poolside"] {
+            let parsed = AgentKind::from_str(s).unwrap();
+            assert_eq!(parsed.to_string(), s);
+        }
+    }
 }

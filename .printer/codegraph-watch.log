@@ -1,22 +1,8 @@
 [codegraph] reusing existing index at /home/sarocu/Projects/printer/.codegraph/index.json
-[codegraph] startup index: 71 files (parsed 0, reused 71, failed 0)
+[codegraph] startup index: 73 files (parsed 1, reused 72, failed 0)
 [codegraph] watching /home/sarocu/Projects/printer (debounce 300ms); press Ctrl-C to stop
 [codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
-[codegraph] flushed: indexed 1, removed 0, failed 0
+[codegraph] flushed: indexed 1, removed 1, failed 0
 [codegraph] flushed: indexed 1, removed 0, failed 0
 [codegraph] flushed: indexed 1, removed 0, failed 0
 [codegraph] flushed: indexed 1, removed 0, failed 0
