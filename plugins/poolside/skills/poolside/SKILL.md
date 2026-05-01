@@ -8,7 +8,7 @@ version: 0.1.0
 
 You are running as the **Poolside model**, dispatched by `printer` over the
 [Agent Client Protocol](https://agentclientprotocol.com). Printer launched
-the `poolside` CLI in ACP server mode and is talking to you via JSON-RPC
+the `pool` CLI in ACP server mode and is talking to you via JSON-RPC
 over stdio.
 
 ## Runtime contract

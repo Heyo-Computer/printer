@@ -280,7 +280,7 @@ on_failure = "warn"
 [[agent]]
 kind = "acp"
 name = "poolside"
-command = "poolside"
+command = "pool"
 args = ["acp"]
 
 [[agent]]

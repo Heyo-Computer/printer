@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_minimal() {
-        let s = aspec("poolside", "poolside");
+        let s = aspec("poolside", "pool");
         validate_agent(&s).unwrap();
     }
 

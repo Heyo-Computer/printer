@@ -1,17 +1,17 @@
 # Poolside ACP agent for printer.
 #
-# Skill + agent plugin: the `poolside` CLI is shipped by Poolside itself
+# Skill + agent plugin: the `pool` CLI is shipped by Poolside itself
 # (see https://docs.poolside.ai/cli/editor-integration#editor-integration-acp);
 # this plugin only registers the launch glue. No binary is built here.
 #
-# Prereq: the `poolside` binary must be on $PATH. See README.md.
+# Prereq: the `pool` binary must be on $PATH. See README.md.
 
 assets = ["skills"]
 
 [[agent]]
 kind = "acp"
 name = "poolside"
-command = "poolside"
+command = "pool"
 # `acp` selects Poolside CLI's ACP server mode. Confirm against
 # docs.poolside.ai if Poolside renames the subcommand.
 args = ["acp"]

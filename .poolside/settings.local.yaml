@@ -1,0 +1,12 @@
+tools:
+    shell:
+        allow:
+            - cd *
+            - cargo test *
+            - tail *
+paths:
+    allow:
+        - path: /home/sarocu/Projects/printer/plugins/poolside/**
+          write: true
+        - path: /home/sarocu/Projects/printer/printer/**
+          write: true

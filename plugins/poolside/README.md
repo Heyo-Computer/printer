@@ -8,11 +8,11 @@ dispatch through the [Poolside CLI]'s ACP server mode.
 
 ## Prerequisites
 
-The `poolside` binary must be on `$PATH`. See
+The `pool` binary must be on `$PATH`. See
 <https://docs.poolside.ai> for install instructions and credential setup
 (typically a `POOLSIDE_API_KEY` env var or `poolside login`).
 
-If `poolside` is not on `$PATH` at run time, the ACP transport surfaces
+If `pool` is not on `$PATH` at run time, the ACP transport surfaces
 the spawn error from poolside's stderr — there is no silent hang.
 
 ## Install
@@ -58,7 +58,7 @@ Override the launch argv inline if needed:
 
 ```
 printer run spec.md --agent acp:poolside \
-    --acp-bin /custom/path/to/poolside \
+    --acp-bin /custom/path/to/pool \
     --acp-arg --log-level --acp-arg debug
 ```
 
@@ -68,7 +68,7 @@ appended after the manifest's `args`.
 ## Sandbox interaction
 
 If a sandbox driver (e.g. heyvm) is active, printer wraps the ACP server
-launch through the driver's `enter` template — `poolside` runs inside the
+launch through the driver's `enter` template — `pool` runs inside the
 sandbox just like a per-turn child would. The sandbox spans the whole
 printer invocation, so the long-lived ACP session lives for the lifetime
 of the sandbox.

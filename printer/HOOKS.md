@@ -391,7 +391,7 @@ kind = "acp"
 # because they would shadow the built-in --agent choices.
 name = "poolside"
 # Launch command (binary on $PATH, or absolute path). Required.
-command = "poolside"
+command = "pool"
 # Argv tokens appended to `command`. Optional.
 args = ["acp"]
 # Env vars passed to the spawned child. Values are taken as literal strings
@@ -405,14 +405,14 @@ contributes at least one `[[agent]]` block.
 #### Worked example: bundled `plugins/poolside/`
 
 The repo ships a reference ACP plugin at `plugins/poolside/`. Its
-`printer-plugin.toml` is exactly the schema above — `command = "poolside"`,
+`printer-plugin.toml` is exactly the schema above — `command = "pool"`,
 `args = ["acp"]`, plus a `before_run` agent skill (`skills/poolside/`)
 that briefs the implementer to follow host-repo conventions instead of
 imposing Poolside defaults. Install it with
 `printer add-plugin path:plugins/poolside` and dispatch with
 `printer run --agent acp:poolside <spec>`. See
 `plugins/poolside/README.md` for the full install/use story and
-prerequisites (the `poolside` CLI must be on `$PATH`).
+prerequisites (the `pool` CLI must be on `$PATH`).
 
 ### Sandbox interaction
 
