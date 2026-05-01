@@ -87,64 +87,95 @@ pub struct AgentInvocation<'a> {
     pub model: Option<&'a str>,
     pub cwd: Option<&'a Path>,
     pub permission_mode: &'a str,
+    /// If set, the constructed agent command is shell-quoted and substituted
+    /// for `{child}` in this template, then run via `sh -c`. Used by the
+    /// sandbox driver to dispatch the agent inside a VM (see `drivers.rs`).
+    pub command_wrapper: Option<&'a str>,
 }
 
 impl<'a> AgentInvocation<'a> {
     /// Build a fresh-session command (sets the session id).
     pub fn bootstrap(&self, session_id: &Uuid, prompt: &str) -> Command {
-        match self.kind {
-            AgentKind::Claude => self.claude_cmd(Some(session_id), None, prompt),
-            AgentKind::Opencode => self.opencode_cmd(Some(session_id), false, prompt),
-        }
+        let argv = match self.kind {
+            AgentKind::Claude => self.claude_argv(Some(session_id), None, prompt),
+            AgentKind::Opencode => self.opencode_argv(Some(session_id), false, prompt),
+        };
+        self.build_command(argv)
     }
 
     /// Build a resume-session command.
     pub fn resume(&self, session_id: &Uuid, prompt: &str) -> Command {
-        match self.kind {
-            AgentKind::Claude => self.claude_cmd(None, Some(session_id), prompt),
-            AgentKind::Opencode => self.opencode_cmd(Some(session_id), true, prompt),
+        let argv = match self.kind {
+            AgentKind::Claude => self.claude_argv(None, Some(session_id), prompt),
+            AgentKind::Opencode => self.opencode_argv(Some(session_id), true, prompt),
+        };
+        self.build_command(argv)
+    }
+
+    fn build_command(&self, argv: Vec<String>) -> Command {
+        if let Some(template) = self.command_wrapper {
+            let quoted = crate::drivers::shell_quote_argv(&argv);
+            let resolved = template.replace("{child}", &quoted);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(&resolved);
+            if let Some(cwd) = self.cwd {
+                cmd.current_dir(cwd);
+            }
+            cmd
+        } else {
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]);
+            if let Some(cwd) = self.cwd {
+                cmd.current_dir(cwd);
+            }
+            cmd
         }
     }
 
-    fn claude_cmd(&self, session_id: Option<&Uuid>, resume: Option<&Uuid>, prompt: &str) -> Command {
-        let mut cmd = Command::new("claude");
-        cmd.arg("--print")
-            .arg("--output-format")
-            .arg("json")
-            .arg("--permission-mode")
-            .arg(self.permission_mode);
+    fn claude_argv(&self, session_id: Option<&Uuid>, resume: Option<&Uuid>, prompt: &str) -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "claude".into(),
+            "--print".into(),
+            "--output-format".into(),
+            "json".into(),
+            "--permission-mode".into(),
+            self.permission_mode.to_string(),
+        ];
         if let Some(id) = session_id {
-            cmd.arg("--session-id").arg(id.to_string());
+            v.push("--session-id".into());
+            v.push(id.to_string());
         }
         if let Some(id) = resume {
-            cmd.arg("--resume").arg(id.to_string());
+            v.push("--resume".into());
+            v.push(id.to_string());
         }
         if let Some(model) = self.model {
-            cmd.arg("--model").arg(model);
+            v.push("--model".into());
+            v.push(model.to_string());
         }
-        if let Some(cwd) = self.cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd.arg(prompt);
-        cmd
+        v.push(prompt.to_string());
+        v
     }
 
-    fn opencode_cmd(&self, session_id: Option<&Uuid>, resume: bool, prompt: &str) -> Command {
-        let mut cmd = Command::new("opencode");
-        cmd.arg("run").arg("--prompt").arg(prompt);
+    fn opencode_argv(&self, session_id: Option<&Uuid>, resume: bool, prompt: &str) -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "opencode".into(),
+            "run".into(),
+            "--prompt".into(),
+            prompt.to_string(),
+        ];
         if let Some(id) = session_id {
-            cmd.arg("--session").arg(id.to_string());
+            v.push("--session".into());
+            v.push(id.to_string());
         }
         if resume {
-            cmd.arg("--continue");
+            v.push("--continue".into());
         }
         if let Some(model) = self.model {
-            cmd.arg("--model").arg(model);
+            v.push("--model".into());
+            v.push(model.to_string());
         }
-        if let Some(cwd) = self.cwd {
-            cmd.current_dir(cwd);
-        }
-        cmd
+        v
     }
 
     /// Parse stdout from a completed agent process into a normalized outcome.

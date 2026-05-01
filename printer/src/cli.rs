@@ -39,6 +39,9 @@ pub enum Command {
     /// Inspect the lifecycle hooks installed plugins have registered.
     #[command(subcommand_help_heading = "Hook subcommands")]
     Hooks(HooksArgs),
+    /// Inspect or edit the global config at `~/.printer/config.toml`.
+    #[command(subcommand_help_heading = "Config subcommands")]
+    Config(ConfigArgs),
     /// Forward to an installed plugin: `printer <plugin> <args>...`.
     #[command(external_subcommand)]
     External(Vec<OsString>),
@@ -113,6 +116,11 @@ pub struct RunArgs {
     /// stdin is not a terminal and the run is intentionally plugin-free.
     #[arg(long, default_value_t = false)]
     pub skip_plugin_check: bool,
+
+    /// Skip dispatching the agent inside a sandbox driver, even if an
+    /// installed plugin contributes one. Useful for debugging on the host.
+    #[arg(long, default_value_t = false)]
+    pub no_sandbox: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -192,6 +200,11 @@ pub struct ReviewArgs {
     /// Show a live spinner and periodic heartbeats during the review turn.
     #[arg(long, short, default_value_t = false)]
     pub verbose: bool,
+
+    /// Skip dispatching the review agent inside a sandbox driver, even if an
+    /// installed plugin contributes one.
+    #[arg(long, default_value_t = false)]
+    pub no_sandbox: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -268,6 +281,12 @@ pub struct ExecArgs {
     /// disable the cycle entirely (single review, no fix pass).
     #[arg(long)]
     pub max_review_passes: Option<u32>,
+
+    /// Skip dispatching the agent inside a sandbox driver, even if an
+    /// installed plugin contributes one. Applies to both run and review
+    /// phases of the exec.
+    #[arg(long, default_value_t = false)]
+    pub no_sandbox: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -333,6 +352,22 @@ pub struct HooksListArgs {
     /// Filter to a single event (e.g. `after_review`).
     #[arg(long)]
     pub event: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Pretty-print the resolved config (defaults included if the file is
+    /// missing).
+    Show,
+    /// Open `~/.printer/config.toml` in `$EDITOR`, seeding it from a default
+    /// template if it does not yet exist.
+    Edit,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

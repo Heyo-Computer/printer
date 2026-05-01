@@ -1,0 +1,38 @@
+# Hooks and driver the `heyvm` plugin contributes when installed.
+#
+# Skill-only / driver-only plugin: heyvm itself is an external CLI shipped from
+# https://docs.heyo.computer, so there is no Cargo crate here. Installing this
+# plugin registers a sandbox driver that dispatches every agent turn through
+# `heyvm worktree`, plus a before_run skill so the agent understands it is
+# running inside a worktree.
+#
+# Prereq: the `heyvm` binary must be on $PATH. See README.md.
+
+assets = ["skills"]
+
+# --- Sandbox driver -------------------------------------------------------
+
+[driver]
+kind = "vm"
+
+# `heyvm worktree create` must print the new worktree handle (id / name) on
+# stdout — printer captures stdout and stores it as `{handle}`. If a future
+# heyvm release prints human prose instead, wrap with
+# `sh -c 'heyvm worktree create … | tail -n1'`.
+create = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
+
+# `{child}` is shell-quoted by printer (drivers.rs::shell_quote), so wrapping
+# it in `sh -c` is the right form: heyvm execs `sh -c '<quoted argv>'` inside
+# the worktree.
+enter = "heyvm worktree exec {handle} -- sh -c {child}"
+
+sync_in  = "heyvm worktree push {handle} {cwd}"
+sync_out = "heyvm worktree pull {handle} {cwd}"
+destroy  = "heyvm worktree destroy {handle}"
+
+# --- Agent skill ----------------------------------------------------------
+
+[[hooks]]
+type  = "agent"
+event = "before_run"
+skill = "skills/heyvm-sandbox/SKILL.md"

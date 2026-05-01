@@ -1,5 +1,6 @@
 use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::ReviewArgs;
+use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::prompts::review_prompt_with;
 use crate::session::Session;
@@ -136,6 +137,24 @@ pub fn parse_verdict(report: &str) -> Verdict {
 }
 
 pub async fn review(args: ReviewArgs) -> Result<ReviewOutcome> {
+    let sandbox = acquire_sandbox(&args)?;
+    if let Some(sb) = sandbox.as_ref() {
+        sb.sync_in()?;
+    }
+    let outcome = review_with_sandbox(args, sandbox.as_ref()).await;
+    if let Some(sb) = sandbox.as_ref() {
+        sb.sync_out();
+    }
+    outcome
+}
+
+/// Sandbox-aware variant. `printer exec` shares one [`ActiveSandbox`] across
+/// run + review by calling this directly, so the VM lifecycle is created once
+/// per exec rather than per phase.
+pub async fn review_with_sandbox(
+    args: ReviewArgs,
+    sandbox: Option<&ActiveSandbox>,
+) -> Result<ReviewOutcome> {
     let hooks = HookSet::load_installed().unwrap_or_default();
 
     let spec_abs = args
@@ -177,11 +196,20 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewOutcome> {
         eprintln!("[printer] skills available to reviewer: {}", names.join(", "));
     }
 
+    if let Some(sb) = sandbox {
+        eprintln!(
+            "[printer] dispatching review agent inside sandbox driver `{}` (handle: {})",
+            sb.plugin(),
+            sb.handle()
+        );
+    }
+    let wrapper = sandbox.map(|s| s.enter_template());
     let agent = AgentInvocation {
         kind: args.agent,
         model: args.model.as_deref(),
         cwd: cwd_ref,
         permission_mode: &args.permission_mode,
+        command_wrapper: wrapper.as_deref(),
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 
@@ -235,6 +263,46 @@ pub async fn review(args: ReviewArgs) -> Result<ReviewOutcome> {
         verdict,
         report,
     })
+}
+
+fn acquire_sandbox(args: &ReviewArgs) -> Result<Option<ActiveSandbox>> {
+    if args.no_sandbox {
+        return Ok(None);
+    }
+    let cfg = match crate::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[printer] failed to load config ({e}); using defaults");
+            crate::config::GlobalConfig::default()
+        }
+    };
+    let drivers = match DriverSet::load_installed() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[printer] failed to load drivers ({e}); continuing without sandbox");
+            return Ok(None);
+        }
+    };
+    let Some(active) = drivers.resolve(&cfg.sandbox.driver)? else {
+        return Ok(None);
+    };
+    let merged = active.with_overrides(&cfg.sandbox.commands)?;
+    let cwd: PathBuf = match args.cwd.as_deref() {
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("--cwd not found: {}", p.display()))?,
+        None => std::env::current_dir()?,
+    };
+    let spec = args
+        .spec
+        .canonicalize()
+        .with_context(|| format!("spec file not found: {}", args.spec.display()))?;
+    Ok(Some(ActiveSandbox::create(
+        merged,
+        cwd,
+        Some(spec),
+        Some(cfg.sandbox.base_image.clone()),
+    )?))
 }
 
 #[cfg(test)]

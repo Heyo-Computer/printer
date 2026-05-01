@@ -215,11 +215,134 @@ printer hooks list --event after_review
 
 Shows event, plugin name, kind, and resolved command/skill for each hook.
 
+## Sandbox drivers
+
+In addition to `[[hooks]]`, a plugin manifest may declare a `[driver]` block.
+A driver is the plugin role that lets printer dispatch the agent inside an
+isolated environment — typically a heyvm worktree — instead of the host cwd.
+
+Only one driver runs at a time. If exactly one plugin contributes a driver
+the default `sandbox.driver = "auto"` picks it. If multiple plugins contribute
+drivers, printer will refuse to run until you set `sandbox.driver` in
+`~/.printer/config.toml` (see "Global config" below) to pick between them.
+
+### Schema
+
+```toml
+[driver]
+kind = "vm"
+
+# Provision the sandbox. Must print the handle (id / name / path) on stdout —
+# printer captures stdout and stores it as `{handle}` for subsequent steps.
+create = "heyvm worktree create --base ubuntu-22.04 --name printer-{spec}"
+
+# Wrap each child agent invocation. The `{child}` placeholder is required;
+# printer shell-quotes the agent's argv and substitutes it in. Anything else
+# in this template runs verbatim under `sh -c`.
+enter = "heyvm worktree exec {handle} -- {child}"
+
+# (Optional) Push host cwd into the sandbox before the agent runs.
+sync_in = "heyvm worktree push {handle} {cwd}"
+
+# (Optional) Pull artifacts back to the host after the agent finishes.
+sync_out = "heyvm worktree pull {handle} {cwd}"
+
+# (Optional) Tear the sandbox down. Runs from `Drop`, so it fires on panic
+# and on early returns too. Failures are logged and swallowed — sync_out and
+# destroy are best-effort cleanup.
+destroy = "heyvm worktree destroy {handle}"
+
+# (Optional) Preflight script run *inside* the sandbox right after `create`
+# succeeds. printer wraps it through `enter` automatically. Failure here
+# tears the sandbox down and aborts the run; use shell short-circuits
+# (`|| true`) if you want a step to be best-effort.
+post_create = "bash -lc 'cargo fetch || true'"
+```
+
+### Lifecycle
+
+For `printer exec`, the sandbox covers both phases — one `create` per exec,
+one `destroy` at the end:
+
+1. `create`   — once, at the top of `exec` (or `run` / `review` standalone).
+2. `sync_in`  — once, after create.
+3. `enter`    — wraps every agent turn for both run and review phases.
+4. `sync_out` — once, after both phases finish.
+5. `destroy`  — fires from the sandbox guard's `Drop`.
+
+`printer run` and `printer review` invoked directly (without `exec`) each
+manage their own create/destroy lifecycle.
+
+### `{variables}` for driver templates
+
+| Variable       | Available in              | Meaning                                          |
+|----------------|---------------------------|--------------------------------------------------|
+| `{cwd}`        | all steps                 | Working directory printer is operating in        |
+| `{spec}`       | all steps                 | Absolute path to the spec file                   |
+| `{spec_slug}`  | all steps                 | Spec basename, sanitized for use as a sandbox name (alphanumerics, `-`, `_` only) |
+| `{base_image}` | all steps                 | `sandbox.base_image` from `~/.printer/config.toml` |
+| `{handle}`     | all steps after `create`  | Whatever `create` printed on stdout              |
+| `{child}`      | `enter` only (required)   | Shell-quoted argv of the wrapped agent command   |
+
+### Skipping the sandbox
+
+`printer run`, `printer review`, and `printer exec` all accept `--no-sandbox`
+to dispatch on the host even when a driver is installed. Useful for local
+debugging when the driver itself is misbehaving.
+
+## Global config
+
+User-level preferences live in `~/.printer/config.toml`. The file is optional;
+anything you omit falls back to built-in defaults. Use `printer config show`
+to print the resolved values, and `printer config edit` to open the file in
+`$EDITOR` (it is seeded from a default template if missing).
+
+```toml
+[sandbox]
+# Which driver-contributing plugin to dispatch through.
+#   "auto" — pick the only installed driver (errors if more than one).
+#   "off"  — never sandbox, even if a driver is installed.
+#   "<plugin-name>" — pick a specific driver by plugin name.
+driver = "auto"
+
+# Forwarded to the driver's templates as {base_image}.
+base_image = "heyvm:ubuntu-22.04"
+
+# Names of env vars to forward into the sandbox. Driver-specific.
+env = []
+
+# Extra read/write mounts (host:guest), beyond cwd which is mounted by default.
+mounts = []
+
+# Per-step overrides on top of the active driver's manifest. Any key you set
+# here replaces that step's template; anything you omit falls through to the
+# plugin's default. Same `{var}` interpolation as the plugin's [driver] block.
+[sandbox.commands]
+# create  = "heyvm worktree create --base {base_image} --name printer-{spec_slug}"
+# enter   = "heyvm worktree exec {handle} -- {child}"
+# destroy = "heyvm worktree destroy {handle}"
+# sync_in  = "heyvm worktree push {handle} {cwd}"
+# sync_out = "heyvm worktree pull {handle} {cwd}"
+
+# Optional preflight inside the sandbox, run right after `create`. Wrapped via
+# `enter`. Failure aborts the run; use shell short-circuits to make a step
+# best-effort.
+# post_create = "bash -lc 'cargo fetch || true'"
+```
+
+The override merge happens before any sandbox is created, and the merged
+spec is re-validated — so a config typo (`enter` missing `{child}`, an empty
+`create`) fails fast with a clear error rather than silently breaking the run.
+
+`--no-sandbox` on the CLI is equivalent to `sandbox.driver = "off"` for the
+duration of one command.
+
 ## Backwards compatibility
 
 - `printer add-plugin <spec>` works exactly as before. A plugin without
-  `[[hooks]]` in its manifest contributes no hooks (and dispatches via
-  `printer <name> <args>` as it always has).
-- `printer plugins` keeps listing installed plugins.
-- The new hook system is purely additive: removing every `[[hooks]]` entry
-  recovers the old behaviour.
+  `[[hooks]]` or `[driver]` in its manifest contributes nothing (and
+  dispatches via `printer <name> <args>` as it always has).
+- `printer plugins` keeps listing installed plugins; the table now shows a
+  `ROLES` column distinguishing `bin` / `hooks` / `driver` contributions.
+- The new hook and driver systems are purely additive: a manifest with no
+  `[[hooks]]` and no `[driver]` recovers the old behaviour.

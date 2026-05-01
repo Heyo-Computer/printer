@@ -22,6 +22,14 @@ The CLI works with skills to help keep token usage efficient and reduce redundan
 ### Printer Plugins
 The plugin system allows the printer to be extended by running arbitrary commands or skills with lifecycle hooks. See [Hooks](printer/HOOKS.md)
 
+### Sandbox (heyvm)
+Every `printer exec` can dispatch each agent turn through an isolated
+[heyvm](https://docs.heyo.computer) worktree instead of running on the host.
+Install and configure via the bundled plugin — see
+[plugins/heyvm/README.md](plugins/heyvm/README.md) for the two-step install
+and the per-exec lifecycle (sync in → run+review inside the worktree →
+sync out → destroy).
+
 ### Agent Plugins
 the Printer CLI can install a plugin for Claude and OpenCode agents to utilize `codegraph` for searching and patching files. 
 

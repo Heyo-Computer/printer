@@ -13,6 +13,13 @@
       "started_at": "2026-04-29T03:20:03.464902752Z",
       "updated_at": "2026-04-29T03:26:07.591793090Z",
       "archived_at": "2026-04-29T03:38:33.397244520Z"
+    },
+    {
+      "spec": "/home/sarocu/Projects/printer/specs/003-followups.md",
+      "phase": "done",
+      "started_at": "2026-04-29T03:38:33.397347563Z",
+      "updated_at": "2026-04-29T03:44:56.674807501Z",
+      "archived_at": "2026-04-30T16:02:48.550122900Z"
     }
   ]
 }

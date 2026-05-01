@@ -1,6 +1,7 @@
 use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::RunArgs;
 use crate::codegraph_watch;
+use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{AgentContribution, Event, HookContext, HookSet};
 use crate::prompts::{
     bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with, planning_prompt, rotation_prompt,
@@ -26,6 +27,21 @@ pub async fn run(args: RunArgs) -> Result<TokenUsage> {
 pub async fn run_with_feedback(
     args: RunArgs,
     review_feedback: Option<&str>,
+) -> Result<TokenUsage> {
+    // Public entry path: acquire our own sandbox (if any plugin contributes
+    // one) and then dispatch. The CLI flag `--no-sandbox` short-circuits.
+    let sandbox = acquire_sandbox(&args)?;
+    run_with_sandbox(args, review_feedback, sandbox.as_ref()).await
+}
+
+/// Sandbox-aware entry. Used by `printer exec` to share one sandbox between
+/// the run and review phases — exec creates the [`ActiveSandbox`] once and
+/// hands a reference to both phases instead of letting each one create its
+/// own. CLI entries above wrap this with their own per-call sandbox.
+pub async fn run_with_sandbox(
+    args: RunArgs,
+    review_feedback: Option<&str>,
+    sandbox: Option<&ActiveSandbox>,
 ) -> Result<TokenUsage> {
     crate::plugins::prompt_if_no_plugins(args.skip_plugin_check)?;
     let hooks = HookSet::load_installed().unwrap_or_default();
@@ -76,6 +92,31 @@ pub async fn run_with_feedback(
     }
     let injected_block = agent_contrib.render_prompt_block();
 
+    if let Some(sb) = sandbox {
+        eprintln!(
+            "[printer] dispatching run agent inside sandbox driver `{}` (handle: {})",
+            sb.plugin(),
+            sb.handle()
+        );
+    }
+    let wrapper_template = sandbox.map(|s| s.enter_template());
+
+    // Standalone CLI entry: drive sync_in/sync_out around the agent loop. When
+    // exec drives us, it handles these once for both phases (and we receive
+    // an already-set-up sandbox via run_with_sandbox).
+    let owned_sandbox = if !args.no_sandbox && sandbox.is_some() {
+        // We were called via the public entry that constructed the sandbox
+        // itself; sync_in fires here. (`run_with_sandbox` from exec passes a
+        // borrowed sandbox and `args.no_sandbox` is true, so this branch is
+        // only taken on the standalone path.)
+        if let Some(sb) = sandbox {
+            sb.sync_in()?;
+        }
+        true
+    } else {
+        false
+    };
+
     let inner = run_inner(
         &args,
         &hooks,
@@ -85,6 +126,7 @@ pub async fn run_with_feedback(
         injected_block.as_deref(),
         &resolved_skills,
         review_feedback,
+        wrapper_template.as_deref(),
     )
     .await;
 
@@ -92,6 +134,10 @@ pub async fn run_with_feedback(
         .with_spec(spec_abs.clone())
         .with_exit_status(inner.is_ok());
     let _ = hooks.run_cli(Event::AfterRun, &after_ctx);
+
+    if owned_sandbox && let Some(sb) = sandbox {
+        sb.sync_out();
+    }
 
     if let Ok(usage) = &inner {
         eprintln!("[printer] run token usage: {usage}");
@@ -106,6 +152,7 @@ fn resolve_agent_skills(contrib: &AgentContribution) -> Result<Vec<skills::Skill
     skills::resolve(&contrib.skills, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     args: &RunArgs,
     _hooks: &HookSet,
@@ -115,6 +162,7 @@ async fn run_inner(
     injected_block: Option<&str>,
     injected_skills: &[skills::Skill],
     review_feedback: Option<&str>,
+    command_wrapper: Option<&str>,
 ) -> Result<TokenUsage> {
     let printer_bin = std::env::current_exe()
         .context("resolving printer binary path for the agent prompt")?;
@@ -125,6 +173,7 @@ async fn run_inner(
         model: args.model.as_deref(),
         cwd: Some(cwd),
         permission_mode: &args.permission_mode,
+        command_wrapper,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 
@@ -285,6 +334,48 @@ async fn run_inner(
     }
 
     anyhow::bail!("--max-turns {} exhausted", args.max_turns);
+}
+
+/// Acquire a sandbox via the active driver, if any. Returns `Ok(None)` when
+/// `--no-sandbox` is set or no plugin contributes a driver.
+fn acquire_sandbox(args: &RunArgs) -> Result<Option<ActiveSandbox>> {
+    if args.no_sandbox {
+        return Ok(None);
+    }
+    let cfg = match crate::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[printer] failed to load config ({e}); using defaults");
+            crate::config::GlobalConfig::default()
+        }
+    };
+    let drivers = match DriverSet::load_installed() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[printer] failed to load drivers ({e}); continuing without sandbox");
+            return Ok(None);
+        }
+    };
+    let Some(active) = drivers.resolve(&cfg.sandbox.driver)? else {
+        return Ok(None);
+    };
+    let merged = active.with_overrides(&cfg.sandbox.commands)?;
+    let cwd: std::path::PathBuf = match args.cwd.as_deref() {
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("--cwd not found: {}", p.display()))?,
+        None => std::env::current_dir()?,
+    };
+    let spec = args
+        .spec
+        .canonicalize()
+        .with_context(|| format!("spec file not found: {}", args.spec.display()))?;
+    Ok(Some(ActiveSandbox::create(
+        merged,
+        cwd,
+        Some(spec),
+        Some(cfg.sandbox.base_image.clone()),
+    )?))
 }
 
 fn sync_spec(spec_abs: &std::path::Path, tasks_dir: &std::path::Path) -> Result<spec::SyncReport> {

@@ -19,6 +19,15 @@ pub struct AddPluginArgs {
     #[arg(long)]
     pub rev: Option<String>,
 
+    /// Install a plugin that lives in a subdirectory of the cloned repo
+    /// (e.g. `plugins/heyvm` inside a monorepo). Path is relative to the
+    /// clone root, must not contain `..`, and may not be absolute. Ignored
+    /// for `path:` and shell-installer sources. When set, the inferred
+    /// plugin name comes from the subdirectory's basename rather than the
+    /// repo basename.
+    #[arg(long, value_name = "PATH")]
+    pub subdir: Option<String>,
+
     /// Run this shell command as the installer instead of cloning + cargo
     /// install. Use together with --binary so printer knows where the
     /// command landed the executable. Example:

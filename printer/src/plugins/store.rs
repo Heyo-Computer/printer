@@ -15,6 +15,9 @@ pub struct Manifest {
     /// Lifecycle hooks the plugin registers. See `HOOKS.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<crate::hooks::HookSpec>,
+    /// Sandbox/VM driver the plugin contributes (optional). See `HOOKS.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<crate::drivers::DriverSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,8 +121,9 @@ pub fn prompt_if_no_plugins(skip: bool) -> Result<()> {
 
     eprintln!(
         "[printer] no plugins installed under ~/.printer/plugins/. \
-         Plugins contribute lifecycle hooks, prompt blocks, and skills the agent uses; \
-         without them the run will only see the spec. \
+         Plugins contribute lifecycle hooks, prompt blocks, and skills the agent uses, \
+         and a driver-contributing plugin (e.g. `heyvm`) enables sandboxing by default; \
+         without any plugins the run will only see the spec, on the host. \
          Install one with `printer add-plugin <name>`."
     );
 
@@ -200,7 +204,7 @@ pub fn list_installed() -> Result<()> {
     let name_w = found.iter().map(|m| m.name.len()).max().unwrap_or(4).max(4);
     let ver_w = found.iter().map(|m| m.version.len()).max().unwrap_or(7).max(7);
     println!(
-        "{:<name_w$}  {:<ver_w$}  SOURCE",
+        "{:<name_w$}  {:<ver_w$}  ROLES        SOURCE",
         "NAME",
         "VERSION",
         name_w = name_w,
@@ -222,10 +226,26 @@ pub fn list_installed() -> Result<()> {
                 }
             }
         };
+        let mut roles: Vec<&str> = Vec::new();
+        if !m.binary.is_empty() {
+            roles.push("bin");
+        }
+        if !m.hooks.is_empty() {
+            roles.push("hooks");
+        }
+        if m.driver.is_some() {
+            roles.push("driver");
+        }
+        let role_str = if roles.is_empty() {
+            "—".to_string()
+        } else {
+            roles.join("+")
+        };
         println!(
-            "{:<name_w$}  {:<ver_w$}  {}",
+            "{:<name_w$}  {:<ver_w$}  {:<11}  {}",
             m.name,
             m.version,
+            role_str,
             src,
             name_w = name_w,
             ver_w = ver_w

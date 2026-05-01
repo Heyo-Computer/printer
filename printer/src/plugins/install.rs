@@ -6,7 +6,7 @@ use crate::tasks::model::now_iso;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 /// Top-level entry point for `printer add-plugin`.
@@ -31,7 +31,9 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         .with_context(|| format!("creating {}", plugin_dir.display()))?;
 
     let installed = match resolved.kind {
-        ResolvedKind::CargoGit { url } => install_cargo_git(&plugin_dir, &url, args.rev.as_deref())?,
+        ResolvedKind::CargoGit { url, subdir } => {
+            install_cargo_git(&plugin_dir, &url, args.rev.as_deref(), subdir.as_deref())?
+        }
         ResolvedKind::CargoPath { path } => install_cargo_path(&plugin_dir, &path)?,
         ResolvedKind::Shell { command, binary } => install_shell(&command, &binary)?,
     };
@@ -39,13 +41,14 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
     // Read optional `printer-plugin.toml` from the source dir, validate its
     // hooks, and copy any declared asset files alongside the binary so paths
     // referenced by hooks resolve at runtime.
-    let (declared_hooks, declared_assets) = match installed.source_dir.as_deref() {
+    let (declared_hooks, declared_assets, declared_driver) = match installed.source_dir.as_deref() {
         Some(src) => {
             let sm = SourceManifest::load(src)?;
             let hooks = sm.validate_hooks(&name, &plugin_dir)?;
-            (hooks, sm.assets)
+            let driver = sm.validate_driver()?;
+            (hooks, sm.assets, driver)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), None),
     };
     if let Some(src) = installed.source_dir.as_deref()
         && !declared_assets.is_empty()
@@ -53,6 +56,7 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         source::copy_assets(src, &plugin_dir, &declared_assets)?;
     }
     let hook_count = declared_hooks.len();
+    let has_driver = declared_driver.is_some();
 
     let manifest = Manifest {
         name: name.clone(),
@@ -61,10 +65,14 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
         installed_at: now_iso(),
         source: installed.source,
         hooks: declared_hooks,
+        driver: declared_driver,
     };
     store::write_manifest(&plugin_dir, &manifest)?;
     if hook_count > 0 {
         eprintln!("[printer] registered {hook_count} hook(s) for `{name}`");
+    }
+    if has_driver {
+        eprintln!("[printer] registered sandbox driver for `{name}`");
     }
 
     if manifest.binary.is_empty() {
@@ -93,20 +101,51 @@ struct Installed {
     source_dir: Option<PathBuf>,
 }
 
-fn install_cargo_git(plugin_dir: &Path, url: &str, rev: Option<&str>) -> Result<Installed> {
-    let src_dir = plugin_dir.join("src");
-    eprintln!("[printer] cloning {url} -> {}", src_dir.display());
-    run(Command::new("git").args(["clone", url]).arg(&src_dir))
+fn install_cargo_git(
+    plugin_dir: &Path,
+    url: &str,
+    rev: Option<&str>,
+    subdir: Option<&Path>,
+) -> Result<Installed> {
+    let clone_dir = plugin_dir.join("src");
+    eprintln!("[printer] cloning {url} -> {}", clone_dir.display());
+    run(Command::new("git").args(["clone", url]).arg(&clone_dir))
         .context("git clone failed")?;
     if let Some(rev) = rev {
         eprintln!("[printer] checking out {rev}");
         run(Command::new("git")
-            .current_dir(&src_dir)
+            .current_dir(&clone_dir)
             .args(["checkout", rev]))
         .context("git checkout failed")?;
     }
-    let head = read_head_sha(&src_dir).ok();
-    let (binary, version) = cargo_install_to(&src_dir, plugin_dir)?;
+    let head = read_head_sha(&clone_dir).ok();
+
+    let source_dir = match subdir {
+        Some(sd) => {
+            let joined = clone_dir.join(sd);
+            if !joined.is_dir() {
+                bail!(
+                    "--subdir {} not found in cloned repo (expected {})",
+                    sd.display(),
+                    joined.display()
+                );
+            }
+            joined
+        }
+        None => clone_dir,
+    };
+
+    let (binary, version) = if source_dir.join("Cargo.toml").is_file() {
+        cargo_install_to(&source_dir, plugin_dir)?
+    } else {
+        // Skill-only / driver-only plugin shipped inside a git repo.
+        eprintln!(
+            "[printer] no Cargo.toml at {}; installing as skill-only plugin (no binary)",
+            source_dir.display()
+        );
+        (String::new(), "0.0.0".to_string())
+    };
+
     Ok(Installed {
         binary,
         version,
@@ -114,7 +153,7 @@ fn install_cargo_git(plugin_dir: &Path, url: &str, rev: Option<&str>) -> Result<
             url: url.to_string(),
             rev: head,
         },
-        source_dir: Some(src_dir),
+        source_dir: Some(source_dir),
     })
 }
 
@@ -278,7 +317,7 @@ struct ResolvedSpec {
 
 #[derive(Debug)]
 enum ResolvedKind {
-    CargoGit { url: String },
+    CargoGit { url: String, subdir: Option<PathBuf> },
     CargoPath { path: PathBuf },
     Shell { command: String, binary: String },
 }
@@ -286,8 +325,18 @@ enum ResolvedKind {
 fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
     let name_override = args.name.as_deref();
 
+    // Validate --subdir up front and convert to PathBuf. Only meaningful for
+    // git specs; reject for path:/registry/--install-cmd to avoid silent drops.
+    let subdir = match args.subdir.as_deref() {
+        Some(s) => Some(validate_subdir(s)?),
+        None => None,
+    };
+
     // 1. Explicit --install-cmd wins over everything; spec is just the name.
     if let Some(cmd) = &args.install_cmd {
+        if subdir.is_some() {
+            bail!("--subdir is not supported with --install-cmd");
+        }
         let binary = args
             .binary
             .clone()
@@ -306,9 +355,27 @@ fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
 
     // 2. Local path?
     if let Some(rest) = args.spec.strip_prefix("path:") {
+        if subdir.is_some() {
+            bail!("--subdir is not supported with path: specs (point path: at the plugin dir directly)");
+        }
         let path = PathBuf::from(rest);
         if !path.exists() {
-            bail!("path:{} does not exist", path.display());
+            let abs = path
+                .canonicalize()
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|c| c.join(&path).display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string())
+                });
+            bail!(
+                "path:{} does not exist (resolved to {}). \
+                 path: specs are relative to your current working directory — \
+                 cd to the printer repo root or pass an absolute path",
+                path.display(),
+                abs
+            );
         }
         let inferred = path
             .file_name()
@@ -328,24 +395,40 @@ fn resolve_spec(args: &AddPluginArgs) -> Result<ResolvedSpec> {
         let kind = match &known.installer {
             KnownInstaller::Cargo { git } => ResolvedKind::CargoGit {
                 url: git.to_string(),
+                subdir: subdir.clone(),
             },
-            KnownInstaller::Shell { command, binary } => ResolvedKind::Shell {
-                command: command.to_string(),
-                binary: binary.to_string(),
-            },
+            KnownInstaller::Shell { command, binary } => {
+                if subdir.is_some() {
+                    bail!(
+                        "--subdir is not supported with the `{}` registry entry (shell installer)",
+                        args.spec
+                    );
+                }
+                ResolvedKind::Shell {
+                    command: command.to_string(),
+                    binary: binary.to_string(),
+                }
+            }
         };
         return Ok(ResolvedSpec { name, kind });
     }
 
     // 4. Otherwise treat as a git URL. Heuristic: contains "://", "@", or ends in .git.
     if args.spec.contains("://") || args.spec.contains('@') || args.spec.ends_with(".git") {
-        let inferred = git_url_basename(&args.spec)
+        // Prefer the subdir basename for the inferred name when it's set —
+        // otherwise installing two plugins from one monorepo would collide
+        // on the repo basename.
+        let inferred = subdir
+            .as_deref()
+            .and_then(subdir_basename)
+            .or_else(|| git_url_basename(&args.spec))
             .ok_or_else(|| anyhow!("cannot infer plugin name from `{}`; pass --name", args.spec))?;
         let name = name_override.unwrap_or(&inferred).to_string();
         return Ok(ResolvedSpec {
             name,
             kind: ResolvedKind::CargoGit {
                 url: args.spec.clone(),
+                subdir,
             },
         });
     }
@@ -366,6 +449,36 @@ fn git_url_basename(url: &str) -> Option<String> {
     } else {
         Some(stripped.to_string())
     }
+}
+
+/// Validate `--subdir`: must be a relative path with no `..` components and
+/// no absolute prefix. Returns the parsed `PathBuf` on success. Same shape
+/// as `source::validate_asset_path` so the rules feel consistent.
+fn validate_subdir(s: &str) -> Result<PathBuf> {
+    if s.is_empty() {
+        bail!("--subdir is empty");
+    }
+    let p = Path::new(s);
+    if p.is_absolute() {
+        bail!("--subdir `{s}` must be relative to the clone root");
+    }
+    for comp in p.components() {
+        match comp {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => bail!("--subdir `{s}` may not contain `..`"),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("--subdir `{s}` may not be absolute")
+            }
+        }
+    }
+    Ok(p.to_path_buf())
+}
+
+fn subdir_basename(p: &Path) -> Option<String> {
+    p.file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,4 +509,51 @@ fn read_cargo_toml(dir: &Path) -> Result<CargoToml> {
     let raw = fs::read_to_string(&path)?;
     let parsed: CargoToml = toml::from_str(&raw)?;
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subdir_accepts_relative_paths() {
+        assert_eq!(
+            validate_subdir("plugins/heyvm").unwrap(),
+            PathBuf::from("plugins/heyvm")
+        );
+        assert_eq!(validate_subdir("./skills").unwrap(), PathBuf::from("./skills"));
+    }
+
+    #[test]
+    fn subdir_rejects_traversal_and_absolute() {
+        assert!(validate_subdir("").is_err());
+        assert!(validate_subdir("/etc").is_err());
+        assert!(validate_subdir("../escape").is_err());
+        assert!(validate_subdir("plugins/../../etc").is_err());
+    }
+
+    #[test]
+    fn subdir_basename_takes_last_component() {
+        assert_eq!(
+            subdir_basename(Path::new("plugins/heyvm")),
+            Some("heyvm".to_string())
+        );
+        assert_eq!(
+            subdir_basename(Path::new("heyvm")),
+            Some("heyvm".to_string())
+        );
+        assert_eq!(subdir_basename(Path::new("")), None);
+    }
+
+    #[test]
+    fn git_basename_strips_dot_git_and_trailing_slash() {
+        assert_eq!(
+            git_url_basename("https://github.com/heyo-computer/printer.git"),
+            Some("printer".to_string())
+        );
+        assert_eq!(
+            git_url_basename("git@github.com:heyo-computer/printer/"),
+            Some("printer".to_string())
+        );
+    }
 }

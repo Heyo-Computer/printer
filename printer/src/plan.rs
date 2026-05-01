@@ -48,6 +48,7 @@ pub async fn plan(args: PlanArgs) -> Result<TokenUsage> {
         model: args.model.as_deref(),
         cwd: Some(&cwd),
         permission_mode: &args.permission_mode,
+        command_wrapper: None,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 

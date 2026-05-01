@@ -54,6 +54,7 @@ pub async fn spec_from_followups(args: SpecFromFollowupsArgs) -> Result<()> {
         model: args.model.as_deref(),
         cwd: Some(&cwd),
         permission_mode: &args.permission_mode,
+        command_wrapper: None,
     };
     let mut session = Session::new(agent).with_verbose(args.verbose);
 

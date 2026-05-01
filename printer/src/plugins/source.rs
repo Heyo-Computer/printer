@@ -2,7 +2,7 @@
 //! hooks and asset files to merge into the installed manifest. See
 //! `printer/HOOKS.md` ("Authoring a plugin").
 
-use crate::hooks::{HookSpec, resolve_hook};
+use crate::{drivers::{DriverSpec, validate_driver}, hooks::{HookSpec, resolve_hook}};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::fs;
@@ -16,6 +16,8 @@ pub struct SourceManifest {
     pub hooks: Vec<HookSpec>,
     #[serde(default)]
     pub assets: Vec<String>,
+    #[serde(default)]
+    pub driver: Option<DriverSpec>,
 }
 
 impl SourceManifest {
@@ -45,6 +47,15 @@ impl SourceManifest {
             out.push(spec.clone());
         }
         Ok(out)
+    }
+
+    /// Validate the optional `[driver]` block. Returns the spec ready to
+    /// write into `Manifest::driver`. `None` if the source declares no driver.
+    pub fn validate_driver(&self) -> Result<Option<DriverSpec>> {
+        let Some(spec) = &self.driver else { return Ok(None) };
+        validate_driver(spec)
+            .with_context(|| format!("{FILE_NAME} [driver] block"))?;
+        Ok(Some(spec.clone()))
     }
 }
 

@@ -1,6 +1,8 @@
 mod agent;
 mod cli;
 mod codegraph_watch;
+mod config;
+mod drivers;
 mod exec;
 mod hooks;
 mod init;
@@ -35,7 +37,15 @@ async fn main() -> anyhow::Result<()> {
         cli::Command::AddPlugin(args) => plugins::add_plugin(args),
         cli::Command::Plugins => plugins::list_installed(),
         cli::Command::Hooks(args) => dispatch_hooks(args),
+        cli::Command::Config(args) => dispatch_config(args),
         cli::Command::External(args) => plugins::exec_external(&args),
+    }
+}
+
+fn dispatch_config(args: cli::ConfigArgs) -> anyhow::Result<()> {
+    match args.command {
+        cli::ConfigCommand::Show => config::cli_show(),
+        cli::ConfigCommand::Edit => config::cli_edit(),
     }
 }
 

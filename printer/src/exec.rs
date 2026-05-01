@@ -1,6 +1,7 @@
 use crate::agent::TokenUsage;
 use crate::cli::{ExecArgs, HistoryArgs, ReviewArgs, RunArgs};
 use crate::codegraph_watch;
+use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
@@ -309,6 +310,20 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         | Action::AlreadyDone { spec }
         | Action::FreshAfterDone { spec, .. } => Some(spec.clone()),
     };
+
+    // Provision the sandbox once at the exec level so a single VM covers both
+    // run and review. The inner phases are passed `no_sandbox=true` (via
+    // build_run_args / build_review_args) so they won't try to create their
+    // own; instead they receive a borrowed reference to this one.
+    let sandbox = if args.no_sandbox {
+        None
+    } else {
+        acquire_exec_sandbox(&cwd, exec_spec.clone())?
+    };
+    if let Some(sb) = sandbox.as_ref() {
+        sb.sync_in()?;
+    }
+
     {
         let mut ctx = HookContext::new(Event::BeforeExec, cwd.clone());
         if let Some(s) = &exec_spec {
@@ -317,7 +332,10 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         hooks.run_cli(Event::BeforeExec, &ctx)?;
     }
 
-    let outcome = run_action(&args, &cwd, &checkpoint_path, action, existing).await;
+    let outcome = run_action(&args, &cwd, &checkpoint_path, action, existing, sandbox.as_ref()).await;
+    if let Some(sb) = sandbox.as_ref() {
+        sb.sync_out();
+    }
 
     {
         let mut ctx = HookContext::new(Event::AfterExec, cwd.clone()).with_exit_status(outcome.is_ok());
@@ -336,6 +354,7 @@ async fn run_action(
     checkpoint_path: &Path,
     action: Action,
     existing: Option<Checkpoint>,
+    sandbox: Option<&ActiveSandbox>,
 ) -> Result<()> {
     let total = match action {
         Action::AlreadyDone { spec } => {
@@ -350,7 +369,7 @@ async fn run_action(
         Action::Fresh { spec } => {
             let cp = Checkpoint::new(spec.clone(), Phase::Running);
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path).await?
+            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
         }
         Action::FreshAfterDone { spec, prior } => {
             let history_file = cwd.join(HISTORY_REL);
@@ -367,18 +386,18 @@ async fn run_action(
             );
             let cp = Checkpoint::new(spec.clone(), Phase::Running);
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path).await?
+            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
         }
         Action::ResumeRun { spec } => {
             // Bump updated_at so the file reflects this resume.
             let mut cp = existing.unwrap();
             cp.updated_at = Utc::now();
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path).await?
+            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
         }
         Action::ResumeReview { spec } => {
             eprintln!("[printer] resuming at review phase for {}", spec.display());
-            do_review(&args, &spec, &checkpoint_path).await?
+            do_review(&args, &spec, &checkpoint_path, sandbox).await?
         }
     };
 
@@ -386,10 +405,15 @@ async fn run_action(
     Ok(())
 }
 
-async fn do_run_then_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<TokenUsage> {
-    let mut total = run::run(build_run_args(args, spec)).await?;
+async fn do_run_then_review(
+    args: &ExecArgs,
+    spec: &Path,
+    cp_path: &Path,
+    sandbox: Option<&ActiveSandbox>,
+) -> Result<TokenUsage> {
+    let mut total = run::run_with_sandbox(build_run_args(args, spec), None, sandbox).await?;
     write_phase(cp_path, spec, Phase::ReviewPending)?;
-    let review_total = do_review(args, spec, cp_path).await?;
+    let review_total = do_review(args, spec, cp_path, sandbox).await?;
     total.add(&review_total);
     Ok(total)
 }
@@ -401,7 +425,12 @@ async fn do_run_then_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Res
 ///   3. otherwise, feeds the report to the coding agent (which queues fix
 ///      tasks and works them) and loops back to (1)
 /// Stops early if the verdict is PASS or the cap is hit.
-async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<TokenUsage> {
+async fn do_review(
+    args: &ExecArgs,
+    spec: &Path,
+    cp_path: &Path,
+    sandbox: Option<&ActiveSandbox>,
+) -> Result<TokenUsage> {
     let max_passes = args
         .max_review_passes
         .unwrap_or(DEFAULT_MAX_REVIEW_PASSES)
@@ -410,7 +439,7 @@ async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<Token
 
     for pass in 1..=max_passes {
         eprintln!("[printer] review pass {pass}/{max_passes}");
-        let outcome = review::review(build_review_args(args, spec)).await?;
+        let outcome = review::review_with_sandbox(build_review_args(args, spec), sandbox).await?;
         total.add(&outcome.usage);
 
         if outcome.verdict.is_pass() {
@@ -431,9 +460,10 @@ async fn do_review(args: &ExecArgs, spec: &Path, cp_path: &Path) -> Result<Token
             "[printer] review verdict {} on pass {pass}; feeding report back to coding agent",
             outcome.verdict
         );
-        let fix_usage = run::run_with_feedback(
+        let fix_usage = run::run_with_sandbox(
             build_run_args(args, spec),
             Some(outcome.report.as_str()),
+            sandbox,
         )
         .await
         .with_context(|| format!("fix pass after review pass {pass} failed"))?;
@@ -472,6 +502,10 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         // Exec already ran the plugin check up front; suppress it inside the
         // nested run so we don't re-prompt the user mid-exec.
         skip_plugin_check: true,
+        // Exec acquires one sandbox covering both phases and passes it down
+        // explicitly via run_with_sandbox; the inner run must not create its
+        // own.
+        no_sandbox: true,
     }
 }
 
@@ -486,7 +520,35 @@ fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
         permission_mode: args.permission_mode.clone(),
         skills: args.skills.clone(),
         verbose: args.verbose,
+        no_sandbox: true,
     }
+}
+
+fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>) -> Result<Option<ActiveSandbox>> {
+    let cfg = match crate::config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[printer] failed to load config ({e}); using defaults");
+            crate::config::GlobalConfig::default()
+        }
+    };
+    let drivers = match DriverSet::load_installed() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[printer] failed to load drivers ({e}); continuing without sandbox");
+            return Ok(None);
+        }
+    };
+    let Some(active) = drivers.resolve(&cfg.sandbox.driver)? else {
+        return Ok(None);
+    };
+    let merged = active.with_overrides(&cfg.sandbox.commands)?;
+    Ok(Some(ActiveSandbox::create(
+        merged,
+        cwd.to_path_buf(),
+        spec,
+        Some(cfg.sandbox.base_image.clone()),
+    )?))
 }
 
 #[cfg(test)]
