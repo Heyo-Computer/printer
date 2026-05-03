@@ -264,7 +264,7 @@ async fn run_inner(
                 "[printer] cumulative input tokens {} >= {}; rotating session",
                 session.cumulative_input_tokens, args.compact_at
             );
-            session.rotate();
+            session.rotate().await;
             // First turn of the new session: orient the agent to the world.
             let outcome = session
                 .turn(&rotation_prompt(&printer_bin_str, &spec_abs.to_string_lossy()))

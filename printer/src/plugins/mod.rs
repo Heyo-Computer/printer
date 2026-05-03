@@ -7,5 +7,5 @@ pub mod store;
 
 pub use cli::AddPluginArgs;
 pub use exec::exec_external;
-pub use install::add_plugin;
+pub use install::{add_plugin, reinstall_all, reinstall_plugin};
 pub use store::{list_installed, prompt_if_no_plugins};

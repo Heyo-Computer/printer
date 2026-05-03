@@ -21,8 +21,8 @@ kind = "vm"
 # echo the deterministic slug — that's the {handle} for every later step.
 #
 # Mounts:
-#   {cwd}:/workspace            — the host repo, RW. The agent's cwd.
-#   $HOME/.claude:$HOME/.claude — claude code's state dir, RW. Without
+#   {cwd}:/workspace                    — the host repo, RW. The agent's cwd.
+#   $HOME/.claude:$HOME/.claude         — claude code's state dir, RW. Without
 #       this, heyvm's bubblewrap default exposes $HOME read-only, which
 #       makes every claude `Bash` tool call fail to mkdir
 #       ~/.claude/session-env/<uuid>, and breaks session resume across
@@ -31,12 +31,28 @@ kind = "vm"
 #       write session state. The sandbox can mutate host ~/.claude; for
 #       stricter isolation override `enter` to set HOME to an in-sandbox
 #       writable path and copy credentials in via `post_create`.
+#   $HOME/.local/state:$HOME/.local/state — XDG state base, RW. Standard
+#       Linux convention for ephemeral runtime state, logs, and per-session
+#       data ($XDG_STATE_HOME default). Agents that hardcode
+#       `~/.local/state/<name>/` (e.g. poolside writing
+#       `~/.local/state/poolside/pool/logs/`) would otherwise EROFS on the
+#       bubblewrap-default ro $HOME bind. Mounting RW from host lets any
+#       well-behaved agent that follows XDG-state convention work; the
+#       host dir is created by the preamble so a user who has never
+#       populated it doesn't fail the bind.
+#   $HOME/.cache:$HOME/.cache             — XDG cache base, RW. Same
+#       reasoning as .local/state — agent caches (model artifacts,
+#       prompt-token caches, etc.) need a writable destination.
 #   $HOME is expanded by the outer printer `sh -c`, so different host
 #   users Just Work.
 #
 # `--needs-network` is required for agents that hit external APIs (claude
 # code / codex). `--no-ttl` keeps the sandbox alive for the full exec.
-create = "heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude >&2 && echo printer-{spec_slug}"
+#
+# `mkdir -p` ensures the XDG host dirs exist before the bind: a fresh user
+# may not have populated them, and `heyvm create --mount` errors if the
+# host source path is missing.
+create = "mkdir -p $HOME/.local/state $HOME/.cache && heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude --mount $HOME/.local/state:$HOME/.local/state --mount $HOME/.cache:$HOME/.cache >&2 && echo printer-{spec_slug}"
 
 # After create succeeds, set cwd to the bind-mount once. We use a persistent
 # heyvm session ("printer") that retains cwd across exec calls, so every

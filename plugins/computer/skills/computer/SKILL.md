@@ -1,6 +1,6 @@
 ---
 name: computer
-description: This skill should be used when a review-mode agent needs to verify desktop/UI behavior on a Wayland session — list monitors and toplevel windows, capture screenshots, or synthesize keyboard/mouse/scroll input via uinput. Reach for this skill any time the user asks to "use computer", "screenshot the desktop", "list windows on Wayland", "click at coordinates", "type into the focused app", "send a key chord", or to confirm by visual evidence that a UI change actually landed. Native Wayland equivalent of the xdotool skill — use this instead of xdotool when `$XDG_SESSION_TYPE` is `wayland`.
+description: This skill should be used when an agent needs to drive or verify desktop/UI behavior on a Wayland session — during either implementation (exercising a UI/web change you just made: open a URL, click through flows, capture before/after screenshots) or review (confirming the change actually landed). Lists monitors and toplevel windows, captures screenshots, opens URLs in the default browser, and synthesizes keyboard/mouse/scroll input via uinput. Reach for this skill any time the user asks to "use computer", "screenshot the desktop", "list windows on Wayland", "click at coordinates", "type into the focused app", "send a key chord", "open a URL in the browser", or to confirm by visual evidence that a UI change actually works. Native Wayland equivalent of the xdotool skill — use this instead of xdotool when `$XDG_SESSION_TYPE` is `wayland`.
 version: 0.1.0
 ---
 
@@ -15,15 +15,36 @@ foreign-toplevel protocol is read-only.
 
 ## When to use this skill
 
-You are most likely in a `printer review` turn and need to **verify** a UI
-change rather than make one. Reach for `computer` when the verdict depends on
-something only the screen can answer:
+There are two modes to know about: **review** (you are confirming a change
+already made) and **implementation** (you just made a change and want to
+exercise it before declaring the task done). Both are in scope.
+
+### Review-mode use
+
+You are in a `printer review` turn and need to **verify** a UI change rather
+than make one. Reach for `computer` when the verdict depends on something
+only the screen can answer:
 
 - "Did the new dialog actually render?" → `screenshot` the relevant output.
 - "Is the right window in the foreground?" → `windows --json` and inspect titles.
 - "Does the keyboard shortcut still work?" → `key chord ctrl+shift+t`.
 - "Does typing into the field do the right thing?" → `type 'hello'`.
 - "Is multi-monitor layout sane?" → `outputs --json`.
+
+### Implementation-mode use
+
+You are in a `printer exec` / `printer run` impl turn and just changed a
+desktop or web surface. Static checks (build, unit tests, typecheck) prove
+the code compiles, not that the UI works. Use `computer` to actually run the
+change end-to-end before marking the task done:
+
+- Web app you just touched → `computer browse https://localhost:3000`, then
+  `windows --json` to confirm it loaded, screenshot, click through.
+- Desktop app you just changed → launch it, drive the relevant flow with
+  `key`/`mouse`/`type`, screenshot before and after.
+- Input synthesis is **OK in this mode** — you are deliberately driving the
+  app under test. Still avoid touching unrelated windows or destructive
+  buttons in apps the user happens to have open.
 
 It is also the right tool any time `xdotool` would be reached for but the
 session is Wayland (`echo $XDG_SESSION_TYPE` → `wayland`) — most modern GNOME
@@ -89,6 +110,7 @@ computer key down        <KEY>
 computer key up          <KEY>
 computer key chord       "ctrl+shift+t"
 computer type            [--delay-ms N] "literal text"
+computer browse          <URL>            # open URL in default browser (xdg-open / open)
 computer sleep           <MS>
 ```
 
@@ -130,6 +152,24 @@ Notes that bite if missed:
    target app received or acted on them. Confirm with a follow-up screenshot
    or window-state query.
 
+### End-to-end click-test recipe
+
+For impl-mode verification of a UI/web change, the canonical flow is:
+
+```bash
+computer browse https://localhost:3000      # or launch the desktop app
+computer sleep 800                           # let the page / app paint
+computer windows --json | jq '.[] | .title' # confirm it's actually up
+computer screenshot -o /tmp/before.png
+# ...drive the affected flow with mouse / key / type ...
+computer sleep 300
+computer screenshot -o /tmp/after.png
+```
+
+If `$WAYLAND_DISPLAY` is unset (no display in the sandbox), report this
+explicitly in the task comment / verdict — do not silently skip the click
+test.
+
 ## Quick decision table
 
 | Goal | Command |
@@ -141,6 +181,7 @@ Notes that bite if missed:
 | Click at a known location | `computer mouse move 800 400 --output DP-1 && computer mouse click` |
 | Scroll a document down | `computer mouse scroll 0 5` |
 | Verify multi-monitor geometry | `computer outputs --json` |
+| Open a web app for click-testing | `computer browse https://localhost:3000` |
 
 ## Examples & reference
 

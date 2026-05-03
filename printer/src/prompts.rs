@@ -248,7 +248,12 @@ This turn:\n\
 also empty, every task is finished — output the literal sentinel {done} on its own line and stop.\n\
 2. Otherwise pick the top ready task. Claim it with `{printer} task start <ID>`. Read its \
 description with `{printer} task show <ID>`.\n\
-3. Actually do the work — edit code, run commands, etc. Do not just describe what you would do.\n\
+3. Actually do the work — edit code, run commands, etc. Do not just describe what you would do. \
+If the task touches a desktop UI or web app, do not call it complete on the strength of unit \
+tests alone — run the app you just changed (e.g. `computer browse <local URL>` for a web app, \
+or launch the desktop binary) and use the `computer` skill to click through the affected flow \
+before marking the task done. If `$WAYLAND_DISPLAY` is unset, note that in a `task comment` \
+instead of silently skipping the click-test.\n\
 4. When the task is fully complete, `{printer} task done <ID>`. If you finish quickly you may \
 claim the next ready task and continue; otherwise stop and the driver will call you again.\n\
 5. If you cannot proceed, `{printer} task block <ID> --reason \"…\"` and emit \
@@ -382,9 +387,10 @@ fn append_skills(out: &mut String, skills: &[crate::skills::Skill]) {
 
 const SKILLS_HEADER: &str =
     "\nYou also have skills available — bundled reference docs that explain how to use \
-specific tools for verification (e.g. driving the desktop to confirm a UI change). Read a skill's \
-SKILL.md only when its description matches what you need to verify; do not load skills you will \
-not use. Each skill is read-only reference — using a skill must not modify any project files.\n\
+specific tools for exercising or verifying the change you just made (e.g. driving the desktop or \
+a web app to click-test a UI change end-to-end). Read a skill's SKILL.md only when its description \
+matches what you actually need to do; do not load skills you will not use. Each skill is read-only \
+reference — using a skill must not modify any project files.\n\
 \nAvailable skills:\n";
 
 fn render_review_body(spec_path: &str, base_ref: &str) -> String {
@@ -405,15 +411,23 @@ commands to run. Follow it before falling back to inferring commands from `CLAUD
 4. Verify the change actually works — do not stop at static reading. Run the build/test/lint \
 commands identified in step 3 via your shell tool: typecheck/build, the test suite (or the \
 targeted tests covering the changed code), and any linter the repo already uses. If the change \
-is a UI/runtime behavior that cannot be confirmed by tests alone and a relevant skill is listed \
-below (e.g. desktop automation), use it to confirm the behavior. Capture the actual exit codes \
-and key output lines — do not assume green. If the build/tests do not exist or cannot run in \
-this environment, say so explicitly in the report rather than silently skipping.\n\
+touches a desktop UI or web app, do NOT stop at tests — exercise the running app end-to-end. \
+Start the app (or `computer browse <local URL>` for a web app), then use the `computer` skill \
+to drive the affected flow and capture before/after screenshots as evidence in the report. \
+Input synthesis is allowed here because the app, not the repo, is being mutated; the read-only \
+contract still applies to project files. If `$WAYLAND_DISPLAY` is unset (no display in this \
+sandbox), say so explicitly in the report instead of silently skipping the click-test. \
+Capture the actual exit codes and key output lines — do not assume green. If the build/tests \
+do not exist or cannot run in this environment, say so explicitly in the report rather than \
+silently skipping.\n\
 5. Produce a concise markdown review report on stdout with these sections:\n\
    - `## Verdict` — one of: PASS, PARTIAL, FAIL. A change that does not build or whose tests \
 fail is at most PARTIAL, and FAIL if the failure is in code the spec asked for.\n\
    - `## Verification` — bullet list of the build/test/lint commands you actually ran and their \
-result (pass/fail + the meaningful line of output). If you skipped a check, say why.\n\
+result (pass/fail + the meaningful line of output). If the change has a UI/web surface, also list \
+the click-test steps you actually performed (or an explicit 'no UI surface' / 'no display \
+available' line) so absence of UI verification is visible, not silent. If you skipped a check, \
+say why.\n\
    - `## Per-item findings` — for each checklist item in `{spec}`, mark MET / PARTIAL / MISSING and \
 explain in one line why, citing files/lines.\n\
    - `## Out-of-scope or risky changes` — anything modified that is not justified by the spec, \

@@ -182,7 +182,26 @@ computer mouse up   --button left
 
 ---
 
-## 7. Composed verification flows
+## 7. Launch a URL in the browser
+
+`computer browse <URL>` is fire-and-forget — it shells out to `xdg-open` on
+Linux and `open` on macOS, so the URL must be `http://`, `https://`, or
+`file://`. Use it to bring up a local web app for click-testing without
+hard-coding a browser binary.
+
+```bash
+computer browse https://localhost:3000
+computer sleep 800                         # let the page render
+computer windows --json | jq '.[] | .title'
+computer screenshot -o /tmp/app.png
+```
+
+Empty or non-URL input fails with a non-zero exit; treat that as a programmer
+error rather than retrying.
+
+---
+
+## 8. Composed verification flows
 
 ### "Does the keyboard shortcut open the right window?"
 
@@ -227,7 +246,7 @@ computer key tap Tab           # whatever the next step is
 
 ---
 
-## 8. Common pitfalls
+## 9. Common pitfalls
 
 - **`screenshot` with no `-o`** dumps PNG bytes to stdout; agents will choke.
   Always pass `-o /tmp/foo.png`.
@@ -252,7 +271,7 @@ computer key tap Tab           # whatever the next step is
 
 ---
 
-## 9. Reference
+## 10. Reference
 
 ```bash
 computer help               # list all subcommands

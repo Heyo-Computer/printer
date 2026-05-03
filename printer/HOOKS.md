@@ -421,14 +421,75 @@ wraps one-shot agents also wraps the ACP server launch — the long-lived child
 runs inside the sandbox just like a per-turn child would. Skip with
 `--no-sandbox` for host-side debugging.
 
+### Streaming
+
+While a `session/prompt` is in flight, every `session/update` notification
+for the active sessionId is observed by the transport and routed two ways:
+its text content is appended to the turn's `result_text`, and a one-line
+log is emitted to stderr (prefix `[acp:agent]`). High-signal updates
+(`tool_call`, `tool_call_update`, `plan`, and unknown `sessionUpdate`
+kinds) always log; chunked `agent_message_chunk` / `agent_thought_chunk`
+updates only log under `--verbose`, rate-limited to ~1 line/sec so a
+server that streams a token at a time doesn't flood the log. A spinner
+heartbeat in TTY mode and a 10-second textual heartbeat in pipe mode
+print the most recent activity summary so a stalled server is visibly
+stalled. Set `PRINTER_ACP_TRACE=1` to additionally dump byte-level
+JSON-RPC line traces.
+
+### Cancellation
+
+Ctrl-C during an ACP turn fires a `session/cancel` notification (no
+`id`, fire-and-forget per the ACP spec) so well-behaved servers can
+resolve the in-flight `session/prompt` with `stopReason: cancelled` and
+flush state cleanly. Printer waits up to 500 ms for that resolution; if
+it doesn't land, the ACP server's whole process group is sent SIGKILL —
+the child was spawned with `process_group(0)`, so `kill(-pgid, SIGKILL)`
+reaches any grandchildren that would otherwise hold stdio pipes open.
+The printer turn returns an interrupt error in either case, the ACP
+client is dropped, and the next turn (or rotation) re-bootstraps a fresh
+server. Compaction-by-rotation also calls `shutdown()` on the previous
+ACP client before nulling it, so the prior server's pgid is reaped
+instead of leaking until printer exits.
+
+### Permission modes (advisory)
+
+ACP doesn't standardize a permission policy — the server enforces its
+own, and there's no spec'd field that maps cleanly to Claude's
+`--permission-mode <mode>` flag. Printer therefore treats
+`--permission-mode` as **advisory** when used with `--agent acp:*`:
+
+| Mode                | Behavior                                    |
+| ------------------- | ------------------------------------------- |
+| `bypassPermissions` | no-op (server still applies its own policy) |
+| `acceptEdits`       | no-op (advisory)                            |
+| `default`           | no-op (advisory)                            |
+| `plan`              | no-op (advisory)                            |
+
+The value is surfaced two ways: as an env var `PRINTER_PERMISSION_MODE`
+on the spawned ACP child (so a server *can* read it and adapt if it
+chooses), and as a non-standard `_printerPermissionMode` key alongside
+the spec'd `session/new` params (JSON-RPC servers must ignore unknown
+fields, so this is harmless to non-aware servers). At session bootstrap
+printer prints a one-line advisory:
+
+```
+[printer] acp: --permission-mode is advisory; the ACP server enforces its own policy (mode=…)
+```
+
+This is intentionally conservative — don't pretend a Claude-CLI flag
+controls a Poolside (or any other ACP server's) sandbox. If you need
+strict permission semantics, configure them on the server side.
+
 ### What's wired in this release
 
-T-017 ships the **blocking-turn** transport: `initialize` → `session/new` →
-`session/prompt` per turn, with all `session/update` text content blocks
-concatenated into the agent's reply. Token usage is not yet surfaced (ACP
-doesn't standardize a usage shape) so the compaction-by-rotation trigger will
-not fire mid-session. Streaming-to-stderr, Ctrl-C cancellation via
-`session/cancel`, and permission-mode mapping are tracked on T-020.
+T-017 shipped the **blocking-turn** transport: `initialize` → `session/new`
+→ `session/prompt` per turn, with all `session/update` text content blocks
+concatenated into the agent's reply. T-020 layers on streaming logs
+(see "Streaming" above), Ctrl-C cancellation (see "Cancellation"), and
+the advisory permission-mode mapping documented above. Token usage is
+still not surfaced (ACP doesn't standardize a usage shape), so the
+compaction-by-rotation trigger will not fire mid-session for ACP
+agents — that remains a follow-up.
 
 ## Backwards compatibility
 

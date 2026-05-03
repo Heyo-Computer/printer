@@ -31,6 +31,13 @@ pub enum Source {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rev: Option<String>,
+        /// Subdirectory inside the cloned repo that holds the plugin (the
+        /// original `--subdir` value at install time). Recorded so
+        /// `printer reinstall-plugin` can re-clone monorepo-hosted plugins
+        /// without the user re-typing it. Backwards-compatible: manifests
+        /// from older installs deserialize with `subdir = None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subdir: Option<String>,
     },
     /// Built from a local source directory with `cargo install --path …`.
     Path {
@@ -215,10 +222,16 @@ pub fn list_installed() -> Result<()> {
     );
     for m in &found {
         let src = match &m.source {
-            Source::Git { url, rev } => match rev {
-                Some(r) => format!("git {url}@{}", &r[..r.len().min(8)]),
-                None => format!("git {url}"),
-            },
+            Source::Git { url, rev, subdir } => {
+                let base = match rev {
+                    Some(r) => format!("git {url}@{}", &r[..r.len().min(8)]),
+                    None => format!("git {url}"),
+                };
+                match subdir {
+                    Some(s) => format!("{base} (subdir={s})"),
+                    None => base,
+                }
+            }
             Source::Path { path } => format!("path {path}"),
             Source::Shell { command } => {
                 let trimmed = command.trim();

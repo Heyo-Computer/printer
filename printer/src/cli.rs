@@ -35,6 +35,11 @@ pub enum Command {
     Task(crate::tasks::TaskArgs),
     /// Install a plugin into ~/.printer/plugins/.
     AddPlugin(crate::plugins::AddPluginArgs),
+    /// Reinstall an installed plugin from its recorded source — refreshes the
+    /// snapshot under `~/.printer/plugins/<name>/` after editing the plugin's
+    /// source manifest in-tree (the common case for `path:` installs). Pass
+    /// `--all` to refresh every installed plugin.
+    ReinstallPlugin(ReinstallPluginArgs),
     /// List installed plugins.
     Plugins,
     /// Inspect the lifecycle hooks installed plugins have registered.
@@ -377,6 +382,18 @@ pub struct HistoryArgs {
     /// Emit the raw JSON instead of a human-readable summary.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReinstallPluginArgs {
+    /// Name of the plugin to reinstall (must already be installed). Required
+    /// unless `--all` is set.
+    pub name: Option<String>,
+
+    /// Reinstall every installed plugin in name order. Mutually exclusive
+    /// with a positional name.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
 }
 
 #[derive(clap::Args, Debug)]

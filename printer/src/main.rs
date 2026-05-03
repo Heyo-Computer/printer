@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         }
         cli::Command::Task(args) => tasks::dispatch(args),
         cli::Command::AddPlugin(args) => plugins::add_plugin(args),
+        cli::Command::ReinstallPlugin(args) => dispatch_reinstall_plugin(args),
         cli::Command::Plugins => plugins::list_installed(),
         cli::Command::Hooks(args) => dispatch_hooks(args),
         cli::Command::Config(args) => dispatch_config(args),
@@ -47,6 +48,19 @@ fn dispatch_config(args: cli::ConfigArgs) -> anyhow::Result<()> {
     match args.command {
         cli::ConfigCommand::Show => config::cli_show(),
         cli::ConfigCommand::Edit => config::cli_edit(),
+    }
+}
+
+fn dispatch_reinstall_plugin(args: cli::ReinstallPluginArgs) -> anyhow::Result<()> {
+    match (args.all, args.name.as_deref()) {
+        (true, Some(_)) => {
+            anyhow::bail!("--all and a positional plugin name are mutually exclusive")
+        }
+        (true, None) => plugins::reinstall_all(),
+        (false, Some(name)) => plugins::reinstall_plugin(name),
+        (false, None) => anyhow::bail!(
+            "missing plugin name. Pass `printer reinstall-plugin <name>` or `--all`"
+        ),
     }
 }
 

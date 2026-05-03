@@ -97,6 +97,146 @@ pub fn add_plugin(args: AddPluginArgs) -> Result<()> {
     Ok(())
 }
 
+/// Re-snapshot a single installed plugin from its recorded `Source`. Used by
+/// `printer reinstall-plugin <name>` to refresh a plugin after the user edits
+/// the source manifest in-tree (the common case: `path:` installs from a
+/// local checkout). Equivalent to running `add-plugin <recorded-spec> --force`
+/// without making the user remember the original spec.
+pub fn reinstall_plugin(name: &str) -> Result<()> {
+    let dir = store::plugin_dir(name)?;
+    if !store::installed(name)? {
+        bail!(
+            "plugin `{name}` is not installed at {}; use `printer add-plugin` to install it",
+            dir.display()
+        );
+    }
+    let manifest = store::read_manifest(&dir)?;
+    let args = args_from_manifest(&manifest)?;
+    eprintln!(
+        "[printer] reinstalling `{name}` from {}",
+        source_label(&manifest.source)
+    );
+    add_plugin(args)
+}
+
+/// Reinstall every plugin under `~/.printer/plugins/`. Iterates in name order
+/// for deterministic output. Continues past individual failures and returns a
+/// summary error at the end so one broken plugin doesn't block refreshing the
+/// rest — useful right after an across-the-board manifest edit.
+pub fn reinstall_all() -> Result<()> {
+    let plugins_dir = store::plugins_dir()?;
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&plugins_dir)
+        .with_context(|| format!("reading {}", plugins_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if store::installed(&name)? {
+            names.push(name);
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        eprintln!("[printer] no plugins installed under {}", plugins_dir.display());
+        return Ok(());
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for name in &names {
+        eprintln!("\n[printer] reinstalling `{name}`...");
+        if let Err(e) = reinstall_plugin(name) {
+            eprintln!("[printer] reinstall `{name}` failed: {e:#}");
+            failed.push(name.clone());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "{}/{} plugin(s) failed to reinstall: {}",
+            failed.len(),
+            names.len(),
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Reconstruct an `AddPluginArgs` from a recorded manifest. The constructed
+/// args round-trip through `add_plugin` with `force=true`, re-running the
+/// install for whichever `Source` variant the plugin was originally installed
+/// from. Pure (no I/O) so it's directly testable.
+fn args_from_manifest(manifest: &Manifest) -> Result<AddPluginArgs> {
+    let force = true;
+    let name = Some(manifest.name.clone());
+    Ok(match &manifest.source {
+        Source::Path { path } => AddPluginArgs {
+            spec: format!("path:{path}"),
+            name,
+            rev: None,
+            subdir: None,
+            install_cmd: None,
+            binary: None,
+            force,
+        },
+        Source::Git { url, rev, subdir } => AddPluginArgs {
+            spec: url.clone(),
+            name,
+            rev: rev.clone(),
+            subdir: subdir.clone(),
+            install_cmd: None,
+            binary: None,
+            force,
+        },
+        Source::Shell { command } => {
+            if manifest.binary.is_empty() {
+                bail!(
+                    "plugin `{}` was installed via a shell installer but its \
+                     manifest has no `binary` recorded — cannot reconstruct \
+                     the install args. Reinstall manually with \
+                     `printer add-plugin {} --install-cmd … --binary …`.",
+                    manifest.name,
+                    manifest.name
+                );
+            }
+            AddPluginArgs {
+                spec: manifest.name.clone(),
+                name,
+                rev: None,
+                subdir: None,
+                install_cmd: Some(command.clone()),
+                binary: Some(manifest.binary.clone()),
+                force,
+            }
+        }
+    })
+}
+
+fn source_label(s: &Source) -> String {
+    match s {
+        Source::Path { path } => format!("path {path}"),
+        Source::Git { url, rev, subdir } => {
+            let head = match rev {
+                Some(r) => format!("git {url}@{}", &r[..r.len().min(8)]),
+                None => format!("git {url}"),
+            };
+            match subdir {
+                Some(sd) => format!("{head} (subdir={sd})"),
+                None => head,
+            }
+        }
+        Source::Shell { command } => {
+            let trimmed = command.trim();
+            let cap = trimmed.len().min(40);
+            if trimmed.len() > cap {
+                format!("shell `{}…`", &trimmed[..cap])
+            } else {
+                format!("shell `{trimmed}`")
+            }
+        }
+    }
+}
+
 struct Installed {
     /// Absolute path (or `bin/<name>` relative to plugin_dir, for cargo).
     binary: String,
@@ -159,6 +299,7 @@ fn install_cargo_git(
         source: Source::Git {
             url: url.to_string(),
             rev: head,
+            subdir: subdir.and_then(|p| p.to_str().map(|s| s.to_string())),
         },
         source_dir: Some(source_dir),
     })
@@ -550,6 +691,90 @@ mod tests {
             Some("heyvm".to_string())
         );
         assert_eq!(subdir_basename(Path::new("")), None);
+    }
+
+    fn manifest_with(source: Source, name: &str, binary: &str) -> Manifest {
+        Manifest {
+            name: name.into(),
+            version: "0.1.0".into(),
+            binary: binary.into(),
+            installed_at: "2026-01-01T00:00:00Z".into(),
+            source,
+            hooks: Vec::new(),
+            driver: None,
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn args_from_manifest_path_round_trips() {
+        let m = manifest_with(
+            Source::Path { path: "/abs/plugins/heyvm".into() },
+            "heyvm",
+            "",
+        );
+        let args = args_from_manifest(&m).unwrap();
+        assert_eq!(args.spec, "path:/abs/plugins/heyvm");
+        assert_eq!(args.name.as_deref(), Some("heyvm"));
+        assert!(args.force);
+        assert!(args.install_cmd.is_none());
+        assert!(args.subdir.is_none());
+    }
+
+    #[test]
+    fn args_from_manifest_git_preserves_rev_and_subdir() {
+        let m = manifest_with(
+            Source::Git {
+                url: "https://github.com/heyo-computer/printer".into(),
+                rev: Some("abc1234".into()),
+                subdir: Some("plugins/heyvm".into()),
+            },
+            "heyvm",
+            "",
+        );
+        let args = args_from_manifest(&m).unwrap();
+        assert_eq!(args.spec, "https://github.com/heyo-computer/printer");
+        assert_eq!(args.rev.as_deref(), Some("abc1234"));
+        assert_eq!(args.subdir.as_deref(), Some("plugins/heyvm"));
+        assert_eq!(args.name.as_deref(), Some("heyvm"));
+        assert!(args.force);
+    }
+
+    #[test]
+    fn args_from_manifest_shell_carries_install_cmd_and_binary() {
+        let m = manifest_with(
+            Source::Shell { command: "curl … | sh".into() },
+            "vendor",
+            "/home/u/.local/bin/vendor",
+        );
+        let args = args_from_manifest(&m).unwrap();
+        assert_eq!(args.spec, "vendor");
+        assert_eq!(args.install_cmd.as_deref(), Some("curl … | sh"));
+        assert_eq!(args.binary.as_deref(), Some("/home/u/.local/bin/vendor"));
+        assert!(args.force);
+    }
+
+    #[test]
+    fn args_from_manifest_shell_without_binary_errors() {
+        let m = manifest_with(Source::Shell { command: "x".into() }, "vendor", "");
+        let err = args_from_manifest(&m).unwrap_err();
+        assert!(err.to_string().contains("no `binary` recorded"));
+    }
+
+    #[test]
+    fn source_label_renders_each_variant() {
+        assert!(
+            source_label(&Source::Path { path: "/p".into() }).contains("path /p")
+        );
+        let g = source_label(&Source::Git {
+            url: "https://x/y".into(),
+            rev: Some("0123456789abcdef".into()),
+            subdir: Some("plugins/y".into()),
+        });
+        assert!(g.contains("git https://x/y@01234567"));
+        assert!(g.contains("subdir=plugins/y"));
+        let s = source_label(&Source::Shell { command: "x".into() });
+        assert!(s.contains("shell `x`"));
     }
 
     #[test]

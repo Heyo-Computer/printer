@@ -51,6 +51,11 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         delay_ms: u64,
     },
+    /// Open a URL in the default web browser (fire-and-forget).
+    Browse {
+        /// http://, https://, or file:// URL to open.
+        url: String,
+    },
     /// Sleep for milliseconds.
     Sleep { ms: u64 },
 }
@@ -66,6 +71,7 @@ fn main() -> Result<()> {
         Cmd::Mouse { action } => platform::input::mouse(action),
         Cmd::Key { action } => platform::input::key(action),
         Cmd::Type { text, delay_ms } => platform::input::type_text(&text, delay_ms),
+        Cmd::Browse { url } => platform::browse::run(&url),
         Cmd::Sleep { ms } => {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(())
