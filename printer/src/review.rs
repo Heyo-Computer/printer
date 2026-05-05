@@ -215,6 +215,7 @@ pub async fn review_with_sandbox(
         cwd: cwd_ref,
         permission_mode: &args.permission_mode,
         command_wrapper: wrapper.as_deref(),
+        verbose: args.verbose,
         acp_bin: acp.bin.as_deref(),
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,

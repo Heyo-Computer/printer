@@ -1,15 +1,23 @@
 use crate::agent::TokenUsage;
 use crate::cli::{ExecArgs, HistoryArgs, ReviewArgs, RunArgs};
 use crate::codegraph_watch;
-use crate::drivers::{ActiveSandbox, DriverSet};
+use crate::drivers::{self, ActiveSandbox, DriverSet};
 use crate::hooks::{Event, HookContext, HookSet};
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-const CHECKPOINT_REL: &str = ".printer/exec.json";
+/// Per-spec checkpoint root. Each spec gets its own
+/// `.printer/exec/<key>.json`; running two specs concurrently in the same
+/// cwd no longer collides. Older builds wrote a single file at
+/// `.printer/exec.json` — see `legacy_checkpoint_path`. Stale legacy files
+/// are detected and surfaced as a one-time hint, not migrated automatically.
+const CHECKPOINT_DIR_REL: &str = ".printer/exec";
+const LEGACY_CHECKPOINT_REL: &str = ".printer/exec.json";
 const HISTORY_REL: &str = ".printer/history.json";
 /// Default upper bound on review cycles (one initial review + N-1 follow-ups).
 /// Each non-PASS verdict triggers a fix pass and another review, so this caps
@@ -19,7 +27,15 @@ pub const DEFAULT_MAX_REVIEW_PASSES: u32 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Implementation loop in progress (or crashed mid-loop).
+    /// Planning pass has not yet finished. Set on `Action::Fresh` /
+    /// `Action::FreshAfterDone` before any agent work, and cleared by
+    /// `run.rs` after `planning_pass` completes — so a `--continue` from
+    /// this state re-runs planning (planning may have crashed mid-way and
+    /// re-running it is cheap + idempotent).
+    Planning,
+    /// Planning is done; the implementation loop is in progress (or
+    /// crashed mid-loop). Resuming from this phase skips `planning_pass`
+    /// entirely and goes straight to the exec loop.
     Running,
     /// Run completed cleanly; review has not started yet.
     ReviewPending,
@@ -96,28 +112,35 @@ pub fn print_history(args: HistoryArgs) -> Result<()> {
     };
 
     let history = load_history(&cwd)?;
-    let current_path = cwd.join(CHECKPOINT_REL);
-    let current = if current_path.exists() {
-        Some(Checkpoint::load(&current_path)?)
-    } else {
-        None
-    };
+    let current = list_checkpoints(&cwd)?;
 
     if args.json {
         #[derive(Serialize)]
+        struct CurrentEntry<'a> {
+            path: String,
+            #[serde(flatten)]
+            checkpoint: &'a Checkpoint,
+        }
+        #[derive(Serialize)]
         struct Out<'a> {
-            current: Option<&'a Checkpoint>,
+            current: Vec<CurrentEntry<'a>>,
             history: &'a History,
         }
         let out = Out {
-            current: current.as_ref(),
+            current: current
+                .iter()
+                .map(|(p, cp)| CurrentEntry {
+                    path: p.display().to_string(),
+                    checkpoint: cp,
+                })
+                .collect(),
             history: &history,
         };
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
-    if history.entries.is_empty() && current.is_none() {
+    if history.entries.is_empty() && current.is_empty() {
         println!("No exec history at {}.", history_path(&cwd).display());
         return Ok(());
     }
@@ -137,15 +160,18 @@ pub fn print_history(args: HistoryArgs) -> Result<()> {
         }
     }
 
-    if let Some(cp) = current {
-        println!(
-            "\nCurrent checkpoint ({}): {}  phase={:?}  started={}  updated={}",
-            current_path.display(),
-            cp.spec.display(),
-            cp.phase,
-            cp.started_at.to_rfc3339(),
-            cp.updated_at.to_rfc3339(),
-        );
+    if !current.is_empty() {
+        println!("\nCurrent checkpoints ({}):", current.len());
+        for (path, cp) in &current {
+            println!(
+                "  {}: {}  phase={:?}  started={}  updated={}",
+                path.display(),
+                cp.spec.display(),
+                cp.phase,
+                cp.started_at.to_rfc3339(),
+                cp.updated_at.to_rfc3339(),
+            );
+        }
     }
 
     Ok(())
@@ -183,85 +209,227 @@ impl Checkpoint {
     }
 }
 
-/// Decision the dispatcher makes after consulting the checkpoint and flags.
-/// Pulled out so it can be unit-tested without spawning agents.
+/// Per-cwd directory holding one checkpoint file per in-flight spec.
+pub fn checkpoint_dir(cwd: &Path) -> PathBuf {
+    cwd.join(CHECKPOINT_DIR_REL)
+}
+
+/// Pre-rename location of the single-checkpoint file. Read-only here:
+/// the new code never writes it, but we surface a hint when one exists
+/// so users don't get confused by an orphaned legacy file alongside the
+/// new per-spec layout.
+fn legacy_checkpoint_path(cwd: &Path) -> PathBuf {
+    cwd.join(LEGACY_CHECKPOINT_REL)
+}
+
+/// Stable filesystem-safe key per spec. Combines the human-readable slug
+/// (so `ls .printer/exec/` is meaningful) with an 8-hex-char hash of the
+/// canonical path (so two specs that share a basename — `a/spec.md` and
+/// `b/spec.md` — don't collide). Hash uses the std `DefaultHasher`,
+/// which is non-cryptographic but deterministic within a Rust toolchain;
+/// a Rust upgrade may invalidate in-flight checkpoints, which is fine —
+/// they're per-run state, not durable artifacts.
+pub fn checkpoint_key_for_spec(spec: &Path) -> String {
+    let slug = drivers::make_spec_slug(spec);
+    let mut h = DefaultHasher::new();
+    spec.to_string_lossy().hash(&mut h);
+    let hash32 = (h.finish() & 0xFFFF_FFFF) as u32;
+    format!("{slug}-{hash32:08x}")
+}
+
+pub fn checkpoint_path_for_spec(cwd: &Path, spec: &Path) -> PathBuf {
+    checkpoint_dir(cwd).join(format!("{}.json", checkpoint_key_for_spec(spec)))
+}
+
+/// Load every current checkpoint under `cwd`. Returns `(file_path,
+/// Checkpoint)` pairs sorted by checkpoint `started_at` ascending so
+/// "the only one" picks have a stable order. Empty (and `Ok`) when the
+/// dir is missing — first-run on a clean repo.
+pub fn list_checkpoints(cwd: &Path) -> Result<Vec<(PathBuf, Checkpoint)>> {
+    let dir = checkpoint_dir(cwd);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<(PathBuf, Checkpoint)> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match Checkpoint::load(&path) {
+            Ok(cp) => out.push((path, cp)),
+            Err(e) => eprintln!(
+                "[printer] warning: skipping unreadable checkpoint at {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    out.sort_by(|a, b| a.1.started_at.cmp(&b.1.started_at));
+    Ok(out)
+}
+
+/// One-time hint when an old `.printer/exec.json` is sitting next to
+/// the new `.printer/exec/` dir. Doesn't block; just tells the user
+/// what to do with it.
+fn warn_about_legacy_checkpoint(cwd: &Path) {
+    let legacy = legacy_checkpoint_path(cwd);
+    if legacy.is_file() {
+        eprintln!(
+            "[printer] note: legacy checkpoint at {} is no longer used \
+             (per-spec checkpoints now live under {}/). \
+             Safe to delete: rm {}",
+            legacy.display(),
+            CHECKPOINT_DIR_REL,
+            legacy.display()
+        );
+    }
+}
+
+/// Decision the dispatcher makes after consulting the checkpoint(s) and
+/// flags. Pulled out so it can be unit-tested without spawning agents.
+/// `skip_planning` is true on resume from `Phase::Running` (planning
+/// pass already completed) and false otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
-    /// No checkpoint or fresh start; create one at `spec` and run+review.
+    /// No checkpoint or fresh start; create one at `spec` and run+review
+    /// from the planning pass on.
     Fresh { spec: PathBuf },
-    /// Resume from a `running` checkpoint: re-enter run, then review.
-    ResumeRun { spec: PathBuf },
-    /// Skip run, go straight to review.
+    /// Resume the run phase. `skip_planning=true` when the checkpoint was
+    /// already at `Phase::Running` (planning done); false when at
+    /// `Phase::Planning` (planning needs to redo).
+    ResumeRun { spec: PathBuf, skip_planning: bool },
+    /// Skip run entirely, go straight to review.
     ResumeReview { spec: PathBuf },
     /// Already done; nothing to do.
     AlreadyDone { spec: PathBuf },
-    /// Prior exec for a different spec finished cleanly; archive it to
-    /// history and start a fresh exec for the new spec.
+    /// Prior exec for the *same* spec finished cleanly; archive it to
+    /// history and start a fresh exec for that spec. (Different specs
+    /// no longer collide — they each have their own checkpoint file —
+    /// so "fresh after done" only applies to re-running a spec whose
+    /// checkpoint is at Phase::Done.)
     FreshAfterDone { spec: PathBuf, prior: Checkpoint },
 }
 
-/// Pure decision function — no I/O, no agent spawning. The caller has already
-/// loaded the checkpoint (if any) and resolved the spec from CLI args.
+/// Resolve the (action, checkpoint-path-on-disk) pair from CLI args plus
+/// whatever checkpoints already exist on disk under `cwd`. Pure-ish:
+/// `list_checkpoints` is a directory read but no agents spawn here.
 fn decide(
+    cwd: &Path,
     cli_spec: Option<&Path>,
     cont: bool,
-    existing: Option<&Checkpoint>,
-) -> Result<Action> {
-    match (cont, existing, cli_spec) {
-        (true, None, _) => bail!(
-            "--continue requested but no checkpoint at {CHECKPOINT_REL}; run without --continue first"
-        ),
-        (true, Some(cp), cli) => {
-            // If the user passed a spec, it must match the checkpoint.
-            if let Some(s) = cli {
-                if s != cp.spec {
-                    bail!(
-                        "--continue spec {} does not match checkpoint spec {}",
-                        s.display(),
-                        cp.spec.display()
-                    );
+) -> Result<(Action, PathBuf)> {
+    let all = list_checkpoints(cwd)?;
+
+    match (cont, cli_spec) {
+        (true, Some(spec)) => {
+            // --continue with explicit spec: load that spec's checkpoint
+            // (if any) by key. If the user typo'd a spec that has no
+            // checkpoint, list what we have so they can recover.
+            let path = checkpoint_path_for_spec(cwd, spec);
+            let cp = if path.is_file() {
+                Some(Checkpoint::load(&path)?)
+            } else {
+                None
+            };
+            match cp {
+                Some(cp) => Ok((action_from_phase(&cp), path)),
+                None => bail!(
+                    "--continue {} but no checkpoint at {} for that spec. {}",
+                    spec.display(),
+                    path.display(),
+                    summarize_checkpoints(&all)
+                ),
+            }
+        }
+        (true, None) => {
+            // --continue without a spec: pick the only in-flight
+            // checkpoint, error if zero or many.
+            let in_flight: Vec<_> = all
+                .iter()
+                .filter(|(_, cp)| cp.phase != Phase::Done)
+                .collect();
+            match in_flight.len() {
+                0 => bail!(
+                    "--continue requested but no in-flight checkpoint under {}/. {}",
+                    CHECKPOINT_DIR_REL,
+                    summarize_checkpoints(&all)
+                ),
+                1 => {
+                    let (path, cp) = in_flight[0];
+                    Ok((action_from_phase(cp), path.clone()))
+                }
+                n => bail!(
+                    "--continue requested but {n} in-flight checkpoints exist; \
+                     pass `--continue <spec>` to disambiguate. \
+                     {}",
+                    summarize_checkpoints(&all)
+                ),
+            }
+        }
+        (false, Some(spec)) => {
+            let path = checkpoint_path_for_spec(cwd, spec);
+            let cp = if path.is_file() {
+                Some(Checkpoint::load(&path)?)
+            } else {
+                None
+            };
+            match cp {
+                None => Ok((Action::Fresh { spec: spec.to_path_buf() }, path)),
+                Some(cp) if cp.phase == Phase::Done => {
+                    // Re-running a finished spec: archive + restart.
+                    Ok((
+                        Action::FreshAfterDone {
+                            spec: spec.to_path_buf(),
+                            prior: cp,
+                        },
+                        path,
+                    ))
+                }
+                Some(cp) => {
+                    // Spec has an in-flight checkpoint. Resume from
+                    // recorded phase — bare `printer exec spec.md` after
+                    // a crash should do the right thing without --continue.
+                    Ok((action_from_phase(&cp), path))
                 }
             }
-            Ok(match cp.phase {
-                Phase::Running => Action::ResumeRun { spec: cp.spec.clone() },
-                Phase::ReviewPending => Action::ResumeReview { spec: cp.spec.clone() },
-                Phase::Done => Action::AlreadyDone { spec: cp.spec.clone() },
-            })
         }
-        (false, None, Some(spec)) => Ok(Action::Fresh { spec: spec.to_path_buf() }),
-        (false, Some(cp), Some(spec)) if spec == cp.spec => {
-            // Same spec — proceed from the recorded phase. This makes a
-            // bare `printer exec spec.md` after a crash do the right thing
-            // even without --continue.
-            Ok(match cp.phase {
-                Phase::Running => Action::ResumeRun { spec: cp.spec.clone() },
-                Phase::ReviewPending => Action::ResumeReview { spec: cp.spec.clone() },
-                Phase::Done => Action::AlreadyDone { spec: cp.spec.clone() },
-            })
-        }
-        (false, Some(cp), Some(spec)) => {
-            // Different spec from the checkpoint. If the prior exec finished
-            // cleanly, treat this as a follow-up: archive the old checkpoint
-            // and start fresh. Otherwise the prior exec is still in flight,
-            // so refuse to clobber it.
-            if cp.phase == Phase::Done {
-                Ok(Action::FreshAfterDone {
-                    spec: spec.to_path_buf(),
-                    prior: cp.clone(),
-                })
-            } else {
-                bail!(
-                    "checkpoint at {CHECKPOINT_REL} is for spec {} (phase {:?}); \
-                     refusing to overwrite with {}. Pass --continue to resume the \
-                     prior exec, or remove the checkpoint to start fresh.",
-                    cp.spec.display(),
-                    cp.phase,
-                    spec.display()
-                )
-            }
-        }
-        (false, _, None) => bail!("missing spec path (required unless --continue is set)"),
+        (false, None) => bail!("missing spec path (required unless --continue is set)"),
     }
+}
+
+/// Map a checkpoint's `Phase` to the action we'd take to resume from it.
+fn action_from_phase(cp: &Checkpoint) -> Action {
+    match cp.phase {
+        Phase::Planning => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: false },
+        Phase::Running => Action::ResumeRun { spec: cp.spec.clone(), skip_planning: true },
+        Phase::ReviewPending => Action::ResumeReview { spec: cp.spec.clone() },
+        Phase::Done => Action::AlreadyDone { spec: cp.spec.clone() },
+    }
+}
+
+/// Render a list of existing checkpoints for inclusion in error messages
+/// — helps the user pick the right `--continue <spec>` when there's
+/// ambiguity (or none, in which case we tell them so).
+fn summarize_checkpoints(all: &[(PathBuf, Checkpoint)]) -> String {
+    if all.is_empty() {
+        return "(no checkpoints found)".to_string();
+    }
+    let mut s = String::from("Existing checkpoints:");
+    for (_, cp) in all {
+        s.push_str(&format!(
+            "\n  {} (phase={:?}, started={})",
+            cp.spec.display(),
+            cp.phase,
+            cp.started_at.to_rfc3339(),
+        ));
+    }
+    s
 }
 
 pub async fn exec(args: ExecArgs) -> Result<()> {
@@ -272,7 +440,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
             .with_context(|| format!("--cwd not found: {}", p.display()))?,
         None => std::env::current_dir()?,
     };
-    let checkpoint_path = cwd.join(CHECKPOINT_REL);
+    warn_about_legacy_checkpoint(&cwd);
 
     let cli_spec_abs: Option<PathBuf> = match args.spec.as_deref() {
         Some(p) => Some(
@@ -282,13 +450,16 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         None => None,
     };
 
-    let existing = if checkpoint_path.exists() {
+    let (action, checkpoint_path) =
+        decide(&cwd, cli_spec_abs.as_deref(), args.r#continue)?;
+    // We need the existing checkpoint for ResumeRun's bookkeeping (bumping
+    // updated_at). Re-load from the resolved path — it's the same file
+    // `decide` looked at.
+    let existing = if checkpoint_path.is_file() {
         Some(Checkpoint::load(&checkpoint_path)?)
     } else {
         None
     };
-
-    let action = decide(cli_spec_abs.as_deref(), args.r#continue, existing.as_ref())?;
 
     // Spawn the codegraph watch daemon at the exec level so a single daemon
     // covers both run and review. The inner run is configured (via
@@ -305,7 +476,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
     let hooks = HookSet::load_installed().unwrap_or_default();
     let exec_spec: Option<PathBuf> = match &action {
         Action::Fresh { spec }
-        | Action::ResumeRun { spec }
+        | Action::ResumeRun { spec, .. }
         | Action::ResumeReview { spec }
         | Action::AlreadyDone { spec }
         | Action::FreshAfterDone { spec, .. } => Some(spec.clone()),
@@ -367,9 +538,9 @@ async fn run_action(
             return Ok(());
         }
         Action::Fresh { spec } => {
-            let cp = Checkpoint::new(spec.clone(), Phase::Running);
+            let cp = Checkpoint::new(spec.clone(), Phase::Planning);
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
+            do_run_then_review(&args, &spec, &checkpoint_path, false, sandbox).await?
         }
         Action::FreshAfterDone { spec, prior } => {
             let history_file = cwd.join(HISTORY_REL);
@@ -379,21 +550,31 @@ async fn run_action(
             };
             History::append(&history_file, entry)?;
             eprintln!(
-                "[printer] archived prior exec for {} to {} (phase=done); starting fresh for {}",
+                "[printer] archived prior exec for {} to {} (phase=done); starting fresh",
                 prior.spec.display(),
                 history_file.display(),
-                spec.display()
             );
-            let cp = Checkpoint::new(spec.clone(), Phase::Running);
+            let cp = Checkpoint::new(spec.clone(), Phase::Planning);
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
+            do_run_then_review(&args, &spec, &checkpoint_path, false, sandbox).await?
         }
-        Action::ResumeRun { spec } => {
+        Action::ResumeRun { spec, skip_planning } => {
             // Bump updated_at so the file reflects this resume.
             let mut cp = existing.unwrap();
             cp.updated_at = Utc::now();
             cp.save(&checkpoint_path)?;
-            do_run_then_review(&args, &spec, &checkpoint_path, sandbox).await?
+            if skip_planning {
+                eprintln!(
+                    "[printer] resuming run phase for {} (planning already complete)",
+                    spec.display()
+                );
+            } else {
+                eprintln!(
+                    "[printer] resuming run phase for {} (planning was incomplete; restarting it)",
+                    spec.display()
+                );
+            }
+            do_run_then_review(&args, &spec, &checkpoint_path, skip_planning, sandbox).await?
         }
         Action::ResumeReview { spec } => {
             eprintln!("[printer] resuming at review phase for {}", spec.display());
@@ -409,9 +590,15 @@ async fn do_run_then_review(
     args: &ExecArgs,
     spec: &Path,
     cp_path: &Path,
+    skip_planning: bool,
     sandbox: Option<&ActiveSandbox>,
 ) -> Result<TokenUsage> {
-    let mut total = run::run_with_sandbox(build_run_args(args, spec), None, sandbox).await?;
+    let mut total = run::run_with_sandbox(
+        build_run_args(args, spec, cp_path, skip_planning),
+        None,
+        sandbox,
+    )
+    .await?;
     write_phase(cp_path, spec, Phase::ReviewPending)?;
     let review_total = do_review(args, spec, cp_path, sandbox).await?;
     total.add(&review_total);
@@ -460,8 +647,11 @@ async fn do_review(
             "[printer] review verdict {} on pass {pass}; feeding report back to coding agent",
             outcome.verdict
         );
+        // Fix passes run after planning is conceptually complete — we
+        // don't want each review→fix loop to re-run planning. Pass
+        // skip_planning=true to short-circuit it.
         let fix_usage = run::run_with_sandbox(
-            build_run_args(args, spec),
+            build_run_args(args, spec, cp_path, true),
             Some(outcome.report.as_str()),
             sandbox,
         )
@@ -486,7 +676,34 @@ fn write_phase(cp_path: &Path, spec: &Path, phase: Phase) -> Result<()> {
     cp.save(cp_path)
 }
 
-fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
+/// Advance `cp_path`'s checkpoint from `Phase::Planning` to
+/// `Phase::Running`. Idempotent: if the checkpoint is already past
+/// Planning, it stays put (we never *regress* a phase, since regressing
+/// would re-run already-finished work on a subsequent `--continue`).
+/// Called by `run.rs` once `planning_pass` returns successfully.
+pub fn write_phase_planning_done(cp_path: &Path, spec: &Path) -> Result<()> {
+    if !cp_path.exists() {
+        // No exec-level checkpoint (standalone `printer run`); nothing
+        // to advance. Caller already handles this by not calling us, but
+        // be defensive.
+        return Ok(());
+    }
+    let mut cp = Checkpoint::load(cp_path)?;
+    if cp.phase == Phase::Planning {
+        cp.phase = Phase::Running;
+        cp.spec = spec.to_path_buf();
+        cp.updated_at = Utc::now();
+        cp.save(cp_path)?;
+    }
+    Ok(())
+}
+
+fn build_run_args(
+    args: &ExecArgs,
+    spec: &Path,
+    checkpoint_path: &Path,
+    skip_planning: bool,
+) -> RunArgs {
     RunArgs {
         spec: spec.to_path_buf(),
         agent: args.agent.clone(),
@@ -508,6 +725,12 @@ fn build_run_args(args: &ExecArgs, spec: &Path) -> RunArgs {
         no_sandbox: true,
         acp_bin: args.acp_bin.clone(),
         acp_args: args.acp_args.clone(),
+        // Resume-aware: when the planning pass already completed in a
+        // prior exec attempt, skip it now and jump to the exec loop. The
+        // checkpoint path is plumbed so run.rs can advance phase
+        // (Planning → Running) once planning_pass returns.
+        skip_planning,
+        checkpoint_path: Some(checkpoint_path.to_path_buf()),
     }
 }
 
@@ -558,87 +781,169 @@ fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>) -> Result<Option<Acti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    fn cp(spec: &str, phase: Phase) -> Checkpoint {
-        Checkpoint::new(PathBuf::from(spec), phase)
+    /// Build a Checkpoint for `spec` at `phase` and seed it into the
+    /// per-spec checkpoint file under `cwd`. Returns the file path.
+    fn seed(cwd: &Path, spec: &str, phase: Phase) -> PathBuf {
+        let cp = Checkpoint::new(PathBuf::from(spec), phase);
+        let path = checkpoint_path_for_spec(cwd, Path::new(spec));
+        cp.save(&path).unwrap();
+        path
+    }
+
+    fn empty_cwd() -> TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn checkpoint_round_trips() {
-        let original = cp("/tmp/spec.md", Phase::ReviewPending);
-        let s = serde_json::to_string(&original).unwrap();
-        let parsed: Checkpoint = serde_json::from_str(&s).unwrap();
-        assert_eq!(parsed.spec, original.spec);
-        assert_eq!(parsed.phase, original.phase);
+        let dir = empty_cwd();
+        let cp = Checkpoint::new(PathBuf::from("/tmp/spec.md"), Phase::ReviewPending);
+        let path = checkpoint_path_for_spec(dir.path(), Path::new("/tmp/spec.md"));
+        cp.save(&path).unwrap();
+        let loaded = Checkpoint::load(&path).unwrap();
+        assert_eq!(loaded.spec, cp.spec);
+        assert_eq!(loaded.phase, cp.phase);
+    }
+
+    #[test]
+    fn checkpoint_key_distinguishes_same_basename_in_different_dirs() {
+        let k1 = checkpoint_key_for_spec(Path::new("/projects/a/spec.md"));
+        let k2 = checkpoint_key_for_spec(Path::new("/projects/b/spec.md"));
+        assert_ne!(k1, k2, "same-basename specs in different dirs must hash apart");
+        assert!(k1.starts_with("spec-"));
+        assert!(k2.starts_with("spec-"));
     }
 
     #[test]
     fn fresh_with_spec_no_checkpoint() {
-        let action = decide(Some(Path::new("/tmp/a.md")), false, None).unwrap();
+        let dir = empty_cwd();
+        let (action, _path) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
         assert_eq!(action, Action::Fresh { spec: PathBuf::from("/tmp/a.md") });
     }
 
     #[test]
     fn fresh_without_spec_errors() {
-        let err = decide(None, false, None).unwrap_err();
+        let dir = empty_cwd();
+        let err = decide(dir.path(), None, false).unwrap_err();
         assert!(err.to_string().contains("missing spec"));
     }
 
     #[test]
-    fn continue_without_checkpoint_errors() {
-        let err = decide(None, true, None).unwrap_err();
-        assert!(err.to_string().contains("--continue"));
+    fn continue_without_any_checkpoint_errors() {
+        let dir = empty_cwd();
+        let err = decide(dir.path(), None, true).unwrap_err();
+        assert!(err.to_string().contains("no in-flight checkpoint"));
     }
 
     #[test]
-    fn continue_with_done_yields_already_done() {
-        let c = cp("/tmp/a.md", Phase::Done);
-        let action = decide(None, true, Some(&c)).unwrap();
-        assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
+    fn continue_with_planning_phase_redoes_planning() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Planning);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(
+            action,
+            Action::ResumeRun {
+                spec: PathBuf::from("/tmp/a.md"),
+                skip_planning: false,
+            }
+        );
     }
 
     #[test]
-    fn continue_with_running_yields_resume_run() {
-        let c = cp("/tmp/a.md", Phase::Running);
-        let action = decide(None, true, Some(&c)).unwrap();
-        assert_eq!(action, Action::ResumeRun { spec: PathBuf::from("/tmp/a.md") });
+    fn continue_with_running_phase_skips_planning() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Running);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(
+            action,
+            Action::ResumeRun {
+                spec: PathBuf::from("/tmp/a.md"),
+                skip_planning: true,
+            }
+        );
     }
 
     #[test]
     fn continue_with_review_pending_yields_resume_review() {
-        let c = cp("/tmp/a.md", Phase::ReviewPending);
-        let action = decide(None, true, Some(&c)).unwrap();
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::ReviewPending);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
         assert_eq!(action, Action::ResumeReview { spec: PathBuf::from("/tmp/a.md") });
     }
 
     #[test]
-    fn continue_spec_mismatch_errors() {
-        let c = cp("/tmp/a.md", Phase::Running);
-        let err = decide(Some(Path::new("/tmp/b.md")), true, Some(&c)).unwrap_err();
-        assert!(err.to_string().contains("does not match"));
+    fn continue_with_done_yields_already_done() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Done);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), true).unwrap();
+        assert_eq!(action, Action::AlreadyDone { spec: PathBuf::from("/tmp/a.md") });
     }
 
     #[test]
-    fn fresh_with_running_checkpoint_for_different_spec_errors() {
-        let c = cp("/tmp/a.md", Phase::Running);
-        let err = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap_err();
-        assert!(err.to_string().contains("refusing to overwrite"));
+    fn continue_unknown_spec_errors_with_summary() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Running);
+        let err = decide(dir.path(), Some(Path::new("/tmp/b.md")), true).unwrap_err();
+        // Tells the user what they asked for is missing AND lists what
+        // checkpoints DO exist so they can pick one.
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/b.md"));
+        assert!(msg.contains("Existing checkpoints"));
+        assert!(msg.contains("/tmp/a.md"));
     }
 
     #[test]
-    fn fresh_with_review_pending_checkpoint_for_different_spec_errors() {
-        let c = cp("/tmp/a.md", Phase::ReviewPending);
-        let err = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap_err();
-        assert!(err.to_string().contains("refusing to overwrite"));
+    fn continue_with_no_spec_picks_only_in_flight() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Running);
+        let (action, _) = decide(dir.path(), None, true).unwrap();
+        assert_eq!(
+            action,
+            Action::ResumeRun {
+                spec: PathBuf::from("/tmp/a.md"),
+                skip_planning: true,
+            }
+        );
     }
 
     #[test]
-    fn fresh_with_done_checkpoint_for_different_spec_archives() {
-        let c = cp("/tmp/a.md", Phase::Done);
-        let action = decide(Some(Path::new("/tmp/b.md")), false, Some(&c)).unwrap();
+    fn continue_with_no_spec_and_done_only_errors() {
+        // A Done checkpoint isn't "in flight" — there's nothing to resume,
+        // and `--continue` without a spec means "pick the in-flight one".
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Done);
+        let err = decide(dir.path(), None, true).unwrap_err();
+        assert!(err.to_string().contains("no in-flight checkpoint"));
+    }
+
+    #[test]
+    fn continue_with_no_spec_and_multiple_in_flight_errors() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Running);
+        seed(dir.path(), "/tmp/b.md", Phase::Planning);
+        let err = decide(dir.path(), None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 in-flight checkpoints"));
+        assert!(msg.contains("/tmp/a.md"));
+        assert!(msg.contains("/tmp/b.md"));
+    }
+
+    #[test]
+    fn fresh_with_done_checkpoint_archives_and_restarts() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Done);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
         match action {
             Action::FreshAfterDone { spec, prior } => {
-                assert_eq!(spec, PathBuf::from("/tmp/b.md"));
+                assert_eq!(spec, PathBuf::from("/tmp/a.md"));
                 assert_eq!(prior.spec, PathBuf::from("/tmp/a.md"));
                 assert_eq!(prior.phase, Phase::Done);
             }
@@ -647,17 +952,66 @@ mod tests {
     }
 
     #[test]
+    fn fresh_with_existing_checkpoint_same_spec_resumes() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::ReviewPending);
+        let (action, _) =
+            decide(dir.path(), Some(Path::new("/tmp/a.md")), false).unwrap();
+        assert_eq!(action, Action::ResumeReview { spec: PathBuf::from("/tmp/a.md") });
+    }
+
+    #[test]
+    fn different_specs_dont_collide() {
+        // The whole point of per-spec checkpoint files: starting an exec
+        // for spec B in a cwd that has an in-flight checkpoint for spec A
+        // does not error and does not touch A's checkpoint.
+        let dir = empty_cwd();
+        let a_path = seed(dir.path(), "/tmp/a.md", Phase::Running);
+        let (action, b_path) =
+            decide(dir.path(), Some(Path::new("/tmp/b.md")), false).unwrap();
+        assert_eq!(action, Action::Fresh { spec: PathBuf::from("/tmp/b.md") });
+        assert_ne!(a_path, b_path, "per-spec files must use different paths");
+        // A's checkpoint untouched.
+        assert!(a_path.exists());
+    }
+
+    #[test]
+    fn write_phase_planning_done_advances_only_from_planning() {
+        let dir = empty_cwd();
+        let path = seed(dir.path(), "/tmp/a.md", Phase::Planning);
+        write_phase_planning_done(&path, Path::new("/tmp/a.md")).unwrap();
+        assert_eq!(Checkpoint::load(&path).unwrap().phase, Phase::Running);
+
+        // Already past Planning — must not regress (or progress).
+        let path2 = seed(dir.path(), "/tmp/b.md", Phase::ReviewPending);
+        write_phase_planning_done(&path2, Path::new("/tmp/b.md")).unwrap();
+        assert_eq!(Checkpoint::load(&path2).unwrap().phase, Phase::ReviewPending);
+    }
+
+    #[test]
+    fn list_checkpoints_returns_per_spec_files() {
+        let dir = empty_cwd();
+        seed(dir.path(), "/tmp/a.md", Phase::Running);
+        seed(dir.path(), "/tmp/b.md", Phase::Done);
+        let all = list_checkpoints(dir.path()).unwrap();
+        assert_eq!(all.len(), 2);
+        let specs: Vec<_> = all.iter().map(|(_, c)| c.spec.clone()).collect();
+        assert!(specs.contains(&PathBuf::from("/tmp/a.md")));
+        assert!(specs.contains(&PathBuf::from("/tmp/b.md")));
+    }
+
+    #[test]
     fn history_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.json");
         let entry = HistoryEntry {
-            checkpoint: cp("/tmp/a.md", Phase::Done),
+            checkpoint: Checkpoint::new(PathBuf::from("/tmp/a.md"), Phase::Done),
             archived_at: Utc::now(),
         };
         History::append(&path, entry.clone()).unwrap();
 
         let entry2 = HistoryEntry {
-            checkpoint: cp("/tmp/b.md", Phase::Done),
+            checkpoint: Checkpoint::new(PathBuf::from("/tmp/b.md"), Phase::Done),
             archived_at: Utc::now(),
         };
         History::append(&path, entry2).unwrap();
@@ -666,12 +1020,5 @@ mod tests {
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.entries[0].checkpoint.spec, PathBuf::from("/tmp/a.md"));
         assert_eq!(loaded.entries[1].checkpoint.spec, PathBuf::from("/tmp/b.md"));
-    }
-
-    #[test]
-    fn fresh_with_existing_checkpoint_same_spec_resumes() {
-        let c = cp("/tmp/a.md", Phase::ReviewPending);
-        let action = decide(Some(Path::new("/tmp/a.md")), false, Some(&c)).unwrap();
-        assert_eq!(action, Action::ResumeReview { spec: PathBuf::from("/tmp/a.md") });
     }
 }

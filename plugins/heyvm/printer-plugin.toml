@@ -43,6 +43,16 @@ kind = "vm"
 #   $HOME/.cache:$HOME/.cache             — XDG cache base, RW. Same
 #       reasoning as .local/state — agent caches (model artifacts,
 #       prompt-token caches, etc.) need a writable destination.
+#   $HOME/.local/share:$HOME/.local/share — XDG data base, RW. heyvm's
+#       bubblewrap layout puts an empty `--tmpfs` over `$XDG_DATA_HOME`
+#       on top of the parent `$HOME` ro-bind, so without this mount the
+#       host's `~/.local/share/` is completely invisible inside the
+#       sandbox even though `$HOME` itself is. That hides
+#       `~/.local/share/claude/versions/<v>/` (the actual claude code
+#       binary that `~/.local/bin/claude` symlinks to), so a sandbox run
+#       fails with `claude: not found` despite the symlink resolving on
+#       the host. Re-binding the host's data dir RW restores visibility
+#       of every host-installed agent (claude code, codex, etc.).
 #   $HOME is expanded by the outer printer `sh -c`, so different host
 #   users Just Work.
 #
@@ -52,12 +62,18 @@ kind = "vm"
 # `mkdir -p` ensures the XDG host dirs exist before the bind: a fresh user
 # may not have populated them, and `heyvm create --mount` errors if the
 # host source path is missing.
-create = "mkdir -p $HOME/.local/state $HOME/.cache && heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude --mount $HOME/.local/state:$HOME/.local/state --mount $HOME/.cache:$HOME/.cache >&2 && echo printer-{spec_slug}"
+create = "mkdir -p $HOME/.local/state $HOME/.local/share $HOME/.cache && heyvm create --name printer-{spec_slug} --image {base_image} --no-ttl --needs-network --mount {cwd}:/workspace --mount $HOME/.claude:$HOME/.claude --mount $HOME/.local/state:$HOME/.local/state --mount $HOME/.local/share:$HOME/.local/share --mount $HOME/.cache:$HOME/.cache >&2 && echo printer-{spec_slug}"
 
-# After create succeeds, set cwd to the bind-mount once. We use a persistent
-# heyvm session ("printer") that retains cwd across exec calls, so every
-# subsequent `enter` inherits /workspace as the working directory.
-post_create = "cd /workspace"
+# After create succeeds, set cwd to the bind-mount once and prepend the
+# user-binary directories that come along for the ride via the RO `$HOME`
+# bind. Without this, agents installed under `~/.local/bin/` (claude code,
+# many user-installed CLIs) or `~/.cargo/bin/` aren't on the persistent
+# session's PATH and bare names like `claude` resolve as
+# `sh: claude: not found` even though the file is right there in the
+# sandbox. We use a persistent heyvm session ("printer") that retains cwd
+# *and* exported env across exec calls, so every subsequent `enter`
+# inherits both `/workspace` as cwd and the augmented PATH.
+post_create = "cd /workspace && export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\""
 
 # `{child}` is the agent's argv, shell-quoted token-by-token by printer
 # (drivers.rs::shell_quote_argv). The outer printer `sh -c` parses those

@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use uuid::Uuid;
@@ -94,19 +95,27 @@ impl<'a> Session<'a> {
         let mut child = cmd.spawn().context("failed to spawn agent process")?;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let agent_active = Arc::new(AtomicBool::new(false));
+        // Activity tracking for the heartbeat: last stderr line timestamp
+        // (so we can show "last [agent] line Ns ago" instead of binary
+        // active/waiting), and a running stdout byte counter (so even an
+        // agent that's silent on stderr but streaming a result body still
+        // shows progress).
+        let last_stderr: Arc<StdMutex<Option<Instant>>> = Arc::new(StdMutex::new(None));
+        let stdout_bytes_total = Arc::new(AtomicU64::new(0));
 
         // Stream stderr from the child to our own stderr in real time so the
         // user can watch progress.
         let child_stderr = child.stderr.take();
         let verbose = self.verbose;
         let tty = std::io::stderr().is_terminal();
-        let agent_active_clone = agent_active.clone();
+        let last_stderr_clone = last_stderr.clone();
         let stderr_task = tokio::spawn(async move {
             if let Some(stderr) = child_stderr {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    agent_active_clone.store(true, Ordering::Relaxed);
+                    if let Ok(mut g) = last_stderr_clone.lock() {
+                        *g = Some(Instant::now());
+                    }
                     if verbose && tty {
                         // Clear any spinner line, then print the agent line.
                         eprint!("\r\x1b[2K");
@@ -119,9 +128,10 @@ impl<'a> Session<'a> {
         // Optional spinner / heartbeat task.
         let spinner_task = if self.verbose {
             let stop = stop.clone();
-            let agent_active = agent_active.clone();
+            let last_stderr = last_stderr.clone();
+            let bytes = stdout_bytes_total.clone();
             Some(tokio::spawn(async move {
-                heartbeat_loop(stop, agent_active, started, tty).await;
+                heartbeat_loop(stop, last_stderr, bytes, started, tty).await;
             }))
         } else {
             None
@@ -159,7 +169,10 @@ impl<'a> Session<'a> {
                 read = stdout.read(&mut chunk), if !read_done => {
                     match read? {
                         0 => { read_done = true; }
-                        n => { stdout_bytes.extend_from_slice(&chunk[..n]); }
+                        n => {
+                            stdout_bytes.extend_from_slice(&chunk[..n]);
+                            stdout_bytes_total.fetch_add(n as u64, Ordering::Relaxed);
+                        }
                     }
                 }
                 wait = child.wait(), if read_done => {
@@ -270,11 +283,24 @@ impl<'a> Session<'a> {
                 t.elapsed().as_secs_f32()
             );
 
-            let cwd = self
-                .agent
-                .cwd
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            // The cwd we ship to `session/new` is the path the *agent*
+            // sees from inside its execution context, not the host path.
+            // When a sandbox driver is active (`command_wrapper` Some),
+            // the agent runs inside the sandbox where the workspace is
+            // bind-mounted at `/workspace` (the host path is visible only
+            // through a sibling RO bind, so writes against it EROFS — and
+            // poolside writes a `.poolside/` config dir under cwd on
+            // first use, which is exactly how that surfaces). For
+            // non-sandboxed runs, use the host cwd we were configured
+            // with (or the printer process's current dir).
+            let cwd = if self.agent.command_wrapper.is_some() {
+                std::path::PathBuf::from("/workspace")
+            } else {
+                self.agent
+                    .cwd
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+            };
             let t = Instant::now();
             let session_id = with_progress(
                 "session/new",
@@ -350,7 +376,8 @@ impl<'a> Session<'a> {
 
 async fn heartbeat_loop(
     stop: Arc<AtomicBool>,
-    agent_active: Arc<AtomicBool>,
+    last_stderr: Arc<StdMutex<Option<Instant>>>,
+    stdout_bytes: Arc<AtomicU64>,
     started: Instant,
     tty: bool,
 ) {
@@ -363,10 +390,18 @@ async fn heartbeat_loop(
             break;
         }
         let elapsed = started.elapsed().as_secs();
-        let active_marker = if agent_active.swap(false, Ordering::Relaxed) {
-            "active"
-        } else {
-            "waiting"
+        let bytes = stdout_bytes.load(Ordering::Relaxed);
+        // Activity label: prefer "last [agent] line Ns ago" when stderr has
+        // ever fired, since that's the most user-meaningful signal. Fall
+        // back to a stdout-bytes counter when stderr is silent (e.g.
+        // claude --print without --verbose only writes the result blob to
+        // stdout). If neither has fired yet, say so explicitly so the user
+        // knows the agent has produced literally nothing — likely still
+        // bootstrapping or thinking before tool use.
+        let activity = match last_stderr.lock().ok().and_then(|g| *g) {
+            Some(t) => format!("last [agent] line {}s ago", t.elapsed().as_secs()),
+            None if bytes > 0 => format!("{bytes} stdout bytes received, no [agent] lines yet"),
+            None => "no output yet".to_string(),
         };
 
         if tty {
@@ -374,14 +409,14 @@ async fn heartbeat_loop(
                 "\r\x1b[2K[printer] {} working… {}s ({})",
                 FRAMES[i % FRAMES.len()],
                 elapsed,
-                active_marker
+                activity
             );
             i = i.wrapping_add(1);
             tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         } else {
             // Non-TTY: emit a textual heartbeat every ~10s, no animation.
             if last_text_heartbeat.elapsed().as_secs() >= 10 {
-                eprintln!("[printer] still working… {elapsed}s ({active_marker})");
+                eprintln!("[printer] still working… {elapsed}s ({activity})");
                 last_text_heartbeat = Instant::now();
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -422,18 +457,18 @@ where
                 if !hint_emitted && elapsed >= 30 {
                     hint_emitted = true;
                     eprintln!(
-                        "[printer] acp: {label} is taking >30s. \
-                         If you're driving an ACP agent through a `heyvm` sandbox, this is \
-                         likely the known `heyvm exec` stdout buffering issue: \
-                         heyvm exec does not stream its child's stdout — it only flushes \
-                         when the child exits, which deadlocks any persistent ACP server \
-                         (the response is generated immediately but held in heyvm's buffer). \
-                         Workaround: re-run with `--no-sandbox`, or pick a sandbox driver \
-                         that streams stdio. Set PRINTER_ACP_TRACE=1 to see byte-level \
-                         transport traces. Other possibilities (less likely if heyvm is \
-                         in use): missing API key / unreachable auth files; child is \
-                         writing to a read-only path inside the sandbox and silently \
-                         retrying."
+                        "[printer] acp: {label} is taking >30s. Common causes: \
+                         (a) the ACP child can't authenticate (missing API key, \
+                         expired creds, or auth files unreachable in the sandbox); \
+                         (b) the child is writing to a path that's read-only inside \
+                         the sandbox and silently retrying (check the sandbox's bind \
+                         mounts vs. the agent's data dir); \
+                         (c) heyvm older than v0.27.2 (its `heyvm exec` buffered child \
+                         stdout instead of streaming, deadlocking any persistent \
+                         ACP server — `heyvm --version` will tell you, run \
+                         `heyvm --upgrade` if needed). \
+                         Set PRINTER_ACP_TRACE=1 for byte-level transport traces, or \
+                         retry with `--no-sandbox` to isolate sandbox vs. agent."
                     );
                 }
             }

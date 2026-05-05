@@ -1,7 +1,7 @@
 ---
 name: heyvm-sandbox
 description: Use this skill any time you are running inside a heyvm sandbox (i.e. a `printer run` / `printer exec` turn dispatched through the heyvm sandbox driver). Explains what is mounted, what is ephemeral, and how to inspect the sandbox from inside it. Triggers when the agent needs to know "where am I", "is this state persistent", "what host paths are visible", or wants to check the sandbox's resources.
-version: 0.3.0
+version: 0.5.0
 ---
 
 # heyvm-sandbox
@@ -25,11 +25,18 @@ extra `sh -c` layer).
   credentials and persist per-session state (conversation logs,
   `session-env/<uuid>` for Bash tool calls). Writes here also land on the
   host, so don't delete or rewrite anything you didn't create yourself.
-- **`~/.local/state` and `~/.cache` are bind-mounted RW** so agents that
-  follow the standard XDG-state / XDG-cache convention (or hardcode
-  `~/.local/state/<name>/` for logs and runtime state) can write without
-  hitting `EROFS`. Writes land on the host, so the same care applies as
-  with `~/.claude`.
+- **`~/.local/state`, `~/.local/share`, and `~/.cache` are bind-mounted
+  RW** so agents that follow the standard XDG-state / XDG-data /
+  XDG-cache convention (or hardcode `~/.local/state/<name>/` for logs
+  and runtime state, or live under `~/.local/share/<name>/` like
+  claude code) can read and write without hitting `EROFS` or empty
+  tmpfs overlays. Writes land on the host, so the same care applies
+  as with `~/.claude`.
+- **`~/.local/bin` and `~/.cargo/bin` are on the session `PATH`** (set
+  once in `post_create` and retained by the persistent `printer` heyvm
+  session). Host-installed CLIs that live there — claude, codex, cargo
+  binaries, npm globals via `prefix` — resolve by bare name without you
+  having to spell out the absolute path.
 - **The rest of `$HOME` is read-only** (heyvm's bubblewrap default).
   Reads work; mkdir/touch outside `~/.claude`, `~/.local/state`,
   `~/.cache`, and `/workspace` will fail with `EROFS`. If you need

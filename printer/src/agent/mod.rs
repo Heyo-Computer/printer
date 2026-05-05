@@ -94,6 +94,14 @@ pub struct AgentInvocation<'a> {
     /// for `{child}` in this template, then run via `sh -c`. Used by the
     /// sandbox driver to dispatch the agent inside a VM (see `drivers.rs`).
     pub command_wrapper: Option<&'a str>,
+    /// Mirror of the user-facing `-v` flag. Reserved for agent-specific
+    /// "show me what you're doing" flags. Currently unused — the claude
+    /// `--verbose` path is disabled because it changes the JSON schema
+    /// (see comment in `claude_argv`); ACP transports use the
+    /// `Session.verbose` direct path instead. Kept on the struct so the
+    /// call sites stay wired when we re-enable a streaming-output mode.
+    #[allow(dead_code)]
+    pub verbose: bool,
     /// Launch command for an ACP agent server. Required when `kind` is
     /// `AgentKind::Acp`. Ignored for one-shot backends. When the user picks
     /// a plugin-contributed agent (`--agent acp:<name>`) the call site
@@ -161,6 +169,18 @@ impl<'a> AgentInvocation<'a> {
             "--permission-mode".into(),
             self.permission_mode.to_string(),
         ];
+        // NOTE: We deliberately do NOT add `--verbose` here, even when the
+        // user passes `-v` to printer. `claude --verbose --output-format
+        // json` changes the stdout schema from a single result object to a
+        // *JSON array* of streamed events (system init, assistant
+        // messages, rate-limit events, then a final `result`). Our
+        // `parse_claude` expects the single-object form and bails on the
+        // array, dumping the raw array text in the error. To get
+        // streaming progress visibility we'd need to switch to
+        // `--output-format stream-json` and rewrite the parser to read
+        // newline-delimited events; tracked as a follow-up. For now the
+        // session-level heartbeat (`last [agent] line Ns ago` /
+        // `<bytes> stdout bytes received`) is what surfaces progress.
         if let Some(id) = session_id {
             v.push("--session-id".into());
             v.push(id.to_string());

@@ -60,6 +60,7 @@ pub async fn spec_from_followups(args: SpecFromFollowupsArgs) -> Result<()> {
         cwd: Some(&cwd),
         permission_mode: &args.permission_mode,
         command_wrapper: None,
+        verbose: args.verbose,
         acp_bin: acp.bin.as_deref(),
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,

@@ -176,12 +176,19 @@ impl AcpClient {
             Arc::new(Mutex::new(DiagnosticBuf::default()));
         let dead = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
+        // Build the writer Arc up-front so the reader can clone it and
+        // respond to server-to-client requests inline. (See
+        // `dispatch_message` — the ACP spec defines `session/request_permission`
+        // and other RPCs that the server *issues* to the client; a server
+        // that gets no reply blocks forever.)
+        let writer: Arc<Mutex<ChildStdin>> = Arc::new(Mutex::new(stdin));
 
         let trace = std::env::var("PRINTER_ACP_TRACE").ok().map(|v| v != "0").unwrap_or(false);
         let pending_for_reader = pending.clone();
         let diag_for_reader = diagnostic.clone();
         let dead_for_reader = dead.clone();
         let shutting_down_for_reader = shutting_down.clone();
+        let writer_for_reader = writer.clone();
         let reader_handle = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             let mut total_lines: u64 = 0;
@@ -214,7 +221,13 @@ impl AcpClient {
                         continue;
                     }
                 };
-                dispatch_message(value, &pending_for_reader, &notif_tx).await;
+                dispatch_message(
+                    value,
+                    &pending_for_reader,
+                    &notif_tx,
+                    Some(&writer_for_reader),
+                )
+                .await;
             }
             if trace {
                 eprintln!(
@@ -297,7 +310,7 @@ impl AcpClient {
         });
 
         Ok(Self {
-            writer: Arc::new(Mutex::new(stdin)),
+            writer,
             pending,
             next_id: AtomicU64::new(1),
             notifications: Mutex::new(notif_rx),
@@ -609,6 +622,10 @@ async fn dispatch_message(
     value: Value,
     pending: &PendingMap,
     notif_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    // `Option` so unit tests that exercise the dispatch logic without a
+    // real `Child` (i.e. without a `ChildStdin`) can still call the
+    // function. Production callers always pass `Some(&writer)`.
+    writer: Option<&Arc<Mutex<ChildStdin>>>,
 ) {
     // Response: has `id` and (`result` or `error`), no `method`.
     if value.get("method").is_none() {
@@ -627,12 +644,14 @@ async fn dispatch_message(
         return;
     }
 
-    // Notification: has `method`, may or may not have `id`. ACP server-pushed
-    // updates use `session/update` with a `sessionId` + `update` payload.
     let method = value
         .get("method")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let req_id = value.get("id").cloned();
+
+    // Notification: has `method`, no `id`. ACP server-pushed
+    // updates use `session/update` with a `sessionId` + `update` payload.
     if method == "session/update" {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let session_id = params
@@ -642,10 +661,98 @@ async fn dispatch_message(
             .to_string();
         let update = params.get("update").cloned().unwrap_or(Value::Null);
         let _ = notif_tx.send(SessionUpdate { session_id, update });
+        return;
     }
-    // Other server→client requests (fs/read_text_file, permission prompts,
-    // etc.) are not handled in T-017 — they would block the server forever
-    // when triggered. Document and revisit in T-020.
+
+    // Server-to-client request: has both `method` *and* `id`. The ACP spec
+    // includes RPCs that flow server→client — `session/request_permission`
+    // (asks the client to approve a tool call), `fs/read_text_file` /
+    // `fs/write_text_file` (filesystem ops gated on the client capability
+    // we sent in `initialize`), terminal RPCs, etc. A server that issues
+    // one of these and gets no response will block its turn indefinitely;
+    // that's exactly what was killing tool execution in poolside before.
+    if let Some(id) = req_id {
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let response = match method {
+            "session/request_permission" => {
+                let outcome = pick_permission_outcome(&params);
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": outcome } })
+            }
+            other => {
+                eprintln!(
+                    "[acp] unhandled server→client request `{other}` (id={id}); replying method-not-found"
+                );
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("printer's ACP client does not handle `{other}`"),
+                    },
+                })
+            }
+        };
+        if let Some(w) = writer {
+            if let Err(e) = send_frame(w, &response).await {
+                eprintln!("[acp] failed to reply to server request `{method}`: {e}");
+            }
+        } else {
+            eprintln!(
+                "[acp] no writer available to reply to `{method}` (id={id}); test path?"
+            );
+        }
+    }
+}
+
+/// Pick a permission-decision outcome for a `session/request_permission`
+/// payload. Printer drives ACP non-interactively — there is no human at
+/// the keyboard to click "approve" — so we always pick the most
+/// permissive `allow_*` option the server offered. Preference order:
+/// `allow_always` (don't ask again for this kind of action), then
+/// `allow_once`, then any other `allow_*` variant the server invented.
+/// Falls back to `cancelled` if no allow option exists, which surfaces
+/// the cancel through the server's tool-call result so the agent can
+/// recover instead of hanging.
+fn pick_permission_outcome(params: &Value) -> Value {
+    let options = params.get("options").and_then(|v| v.as_array());
+    let pick = |kind: &str, opts: &[Value]| -> Option<String> {
+        opts.iter().find_map(|o| {
+            (o.get("kind").and_then(|v| v.as_str()) == Some(kind))
+                .then(|| o.get("optionId").and_then(|v| v.as_str()).map(String::from))
+                .flatten()
+        })
+    };
+    if let Some(opts) = options {
+        for kind in ["allow_always", "allow_once"] {
+            if let Some(id) = pick(kind, opts) {
+                return json!({ "outcome": "selected", "optionId": id });
+            }
+        }
+        // Some servers may use other allow_* kinds — fall back to a prefix
+        // match so we still pick "allow" over "reject" / "cancel".
+        if let Some(id) = opts.iter().find_map(|o| {
+            let kind = o.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if kind.starts_with("allow") {
+                o.get("optionId").and_then(|v| v.as_str()).map(String::from)
+            } else {
+                None
+            }
+        }) {
+            return json!({ "outcome": "selected", "optionId": id });
+        }
+    }
+    json!({ "outcome": "cancelled" })
+}
+
+/// Write one JSON-RPC frame to the server stdin pipe (line-delimited JSON).
+/// Used by `dispatch_message` to reply to server→client requests.
+async fn send_frame(writer: &Arc<Mutex<ChildStdin>>, frame: &Value) -> anyhow::Result<()> {
+    let line = serde_json::to_string(frame)?;
+    let mut w = writer.lock().await;
+    w.write_all(line.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
+    Ok(())
 }
 
 /// Walk an `update` payload and append any text content found. ACP content
@@ -957,7 +1064,7 @@ mod tests {
         pending.lock().await.insert(7, tx);
 
         let msg = json!({"jsonrpc":"2.0","id":7,"result":{"hello":"world"}});
-        dispatch_message(msg, &pending, &notif_tx).await;
+        dispatch_message(msg, &pending, &notif_tx, None).await;
 
         let got = rx.await.unwrap();
         match got {
@@ -975,7 +1082,7 @@ mod tests {
         pending.lock().await.insert(3, tx);
 
         let msg = json!({"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"nope"}});
-        dispatch_message(msg, &pending, &notif_tx).await;
+        dispatch_message(msg, &pending, &notif_tx, None).await;
 
         match rx.await.unwrap() {
             RpcResult::Err(v) => assert_eq!(v["code"], -32601),
@@ -993,13 +1100,57 @@ mod tests {
             "method":"session/update",
             "params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}
         });
-        dispatch_message(msg, &pending, &notif_tx).await;
+        dispatch_message(msg, &pending, &notif_tx, None).await;
 
         let got = notif_rx.recv().await.unwrap();
         assert_eq!(got.session_id, "sess-1");
         let mut buf = String::new();
         collect_update_text(&got.update, &mut buf);
         assert_eq!(buf, "hi");
+    }
+
+    #[test]
+    fn permission_outcome_prefers_allow_always() {
+        let params = json!({
+            "options": [
+                {"kind": "reject_once", "optionId": "no", "name": "Reject"},
+                {"kind": "allow_once", "optionId": "yes-once", "name": "Allow once"},
+                {"kind": "allow_always", "optionId": "yes-always", "name": "Allow always"},
+            ]
+        });
+        let outcome = pick_permission_outcome(&params);
+        assert_eq!(outcome["outcome"], "selected");
+        assert_eq!(outcome["optionId"], "yes-always");
+    }
+
+    #[test]
+    fn permission_outcome_falls_back_to_allow_once() {
+        let params = json!({
+            "options": [
+                {"kind": "reject_once", "optionId": "no"},
+                {"kind": "allow_once", "optionId": "yes-once"},
+            ]
+        });
+        let outcome = pick_permission_outcome(&params);
+        assert_eq!(outcome["optionId"], "yes-once");
+    }
+
+    #[test]
+    fn permission_outcome_cancels_when_no_allow_option() {
+        let params = json!({
+            "options": [
+                {"kind": "reject_once", "optionId": "no"},
+                {"kind": "reject_always", "optionId": "no-always"},
+            ]
+        });
+        let outcome = pick_permission_outcome(&params);
+        assert_eq!(outcome["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn permission_outcome_handles_missing_options_field() {
+        let outcome = pick_permission_outcome(&json!({}));
+        assert_eq!(outcome["outcome"], "cancelled");
     }
 
     #[test]

@@ -88,38 +88,20 @@ RW from the host. If you write or use a different driver, ensure those
 two paths (or at least `~/.local/state/poolside/`) are writable inside
 the sandbox.
 
-### Known incompatibility with `heyvm exec` (as of 2026-05-02)
+### `heyvm exec` streaming (resolved 2026-05-04)
 
-**`heyvm exec` does not stream its child's stdout** — it aggregates and
-only flushes when the child exits. For one-shot agents (claude code,
-opencode) this is invisible because they exit after every turn. For an
-ACP server like `pool acp` it's fatal: poolside answers each
-`session/prompt` immediately, but the response sits in heyvm's stdout
-buffer indefinitely. Printer logs `[printer] acp: still waiting for
-initialize…` and the run never makes progress.
+Earlier `heyvm exec` releases buffered child stdout and only flushed at
+exit, which deadlocked any persistent ACP server. `heyvm` ≥ v0.27.2
+streams stdout in real time, so `printer exec ... --agent acp:poolside`
+through a `heyvm` sandbox now works end-to-end. If you hit a hang on
+`still waiting for initialize…`, first check your heyvm version:
 
-Diagnosis: run `printer exec ... --agent acp:poolside -v` and watch for
-`still waiting for initialize…` climbing past ~30s. Set
-`PRINTER_ACP_TRACE=1` to confirm: you'll see `[acp:trace] writing
-initialize` followed by no `[acp:trace] read line` for the duration.
+```sh
+heyvm --version
+```
 
-Workarounds, ordered by ease:
-
-1. **Run on host: `--no-sandbox`.** This is the recommended path for
-   ACP agents until heyvm grows a streaming mode.
-
-   ```sh
-   printer exec spec.md --agent acp:poolside --no-sandbox
-   ```
-
-2. **Use a different sandbox driver.** Any driver whose `enter` step
-   transparently streams child stdio (Docker with `-i`, plain
-   `nsenter`, etc.) is fine.
-
-3. **File a streaming-stdio bug with heyvm** (the right long-term fix).
-   Reproduction: `(printf 'request\n'; sleep 30) | heyvm exec <handle>
-   --session printer -- pool acp` shows the response only after the
-   30-second sleep ends, not during it.
+and update if it's older than 0.27.2. Set `PRINTER_ACP_TRACE=1` for
+byte-level transport traces if the issue persists after upgrading.
 
 ## See also
 

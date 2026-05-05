@@ -179,6 +179,7 @@ async fn run_inner(
         cwd: Some(cwd),
         permission_mode: &args.permission_mode,
         command_wrapper,
+        verbose: args.verbose,
         acp_bin: acp.bin.as_deref(),
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,
@@ -213,11 +214,19 @@ async fn run_inner(
         }
     }
 
-    // Planning pass: before any code work begins, ask the agent to refine the
-    // parsed tasks into a detailed actionable plan (notes, splits, deps). This
-    // runs unconditionally so a "valid" spec still gets a planning checkpoint.
-    // Skipped if every task is already done — no point planning finished work.
-    {
+    // Planning pass: before any code work begins, ask the agent to refine
+    // the parsed tasks into a detailed actionable plan (notes, splits,
+    // deps). Skipped on resume (`args.skip_planning`) when the exec
+    // checkpoint already moved past `Phase::Planning` — a `--continue`
+    // after a crash post-planning shouldn't redo planning, since it's
+    // expensive and the existing plan is already in the task store.
+    // Also skipped if every task is already done — no point planning
+    // finished work.
+    if args.skip_planning {
+        eprintln!(
+            "[printer] planning pass: skipped (resuming from a checkpoint where planning already completed)"
+        );
+    } else {
         let tasks = store::list_all(tasks_dir)?;
         if !all_done(&tasks) {
             eprintln!("[printer] planning pass: refining {} task(s) into actionable plan entries", tasks.len());
@@ -227,6 +236,19 @@ async fn run_inner(
             print_result_tail(&outcome.result_text);
             if let Some(reason) = blocked_reason(&outcome.result_text) {
                 anyhow::bail!("agent reported blocked during planning: {reason}");
+            }
+        }
+        // Planning is durably complete — advance the exec checkpoint
+        // (if exec.rs gave us one) so a later `--continue` can skip
+        // straight to the run loop instead of redoing this turn. No-op
+        // for standalone `printer run` invocations: they have no
+        // checkpoint to advance.
+        if let Some(cp_path) = args.checkpoint_path.as_deref() {
+            if let Err(e) = crate::exec::write_phase_planning_done(cp_path, spec_abs) {
+                eprintln!(
+                    "[printer] warning: failed to advance checkpoint at {} to Running: {e}",
+                    cp_path.display()
+                );
             }
         }
     }

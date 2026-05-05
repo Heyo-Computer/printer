@@ -138,6 +138,22 @@ pub struct RunArgs {
     /// `--agent acp:<name>` these append to the plugin manifest's `args`.
     #[arg(long = "acp-arg", value_name = "ARG")]
     pub acp_args: Vec<String>,
+
+    /// Internal: skip the planning_pass turn at the start of the run.
+    /// Set by `printer exec` when resuming from `Phase::Running` (planning
+    /// already completed in a prior attempt). Hidden from `--help` because
+    /// `printer run` users have no need to set it manually — a fresh `run`
+    /// always wants planning.
+    #[arg(skip)]
+    pub skip_planning: bool,
+
+    /// Internal: path to the per-spec exec checkpoint
+    /// (`.printer/exec/<key>.json`). When set, run.rs writes
+    /// `Phase::Running` to it after `planning_pass` completes so a later
+    /// `--continue` can skip planning. `None` for standalone `printer run`
+    /// invocations (those don't have an exec-level checkpoint).
+    #[arg(skip)]
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
