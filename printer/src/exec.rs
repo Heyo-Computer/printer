@@ -556,13 +556,8 @@ async fn exec_recursive(args: ExecArgs, cwd: PathBuf) -> Result<()> {
 async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<TokenUsage> {
     use tokio::process::Command as TokioCommand;
     
-    // Create a worktree directory for this task under .printer/worktrees/<task-id>
     let worktree_path = cwd.join(".printer").join("worktrees").join(&task.meta.id);
     let worktree_abs = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.clone());
-
-    // Ensure worktree directory exists
-    std::fs::create_dir_all(&worktree_abs)
-        .with_context(|| format!("creating worktree directory {}", worktree_abs.display()))?;
 
     // Check if we have a git repo for stacked PR pattern
     let has_git = std::process::Command::new("sh")
@@ -572,6 +567,9 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
+
+    // Create worktree via git worktree add (or mkdir fallback)
+    ensure_worktree(cwd, &worktree_path, &task.meta.id, has_git)?;
 
     // Create the task spec file first - needed for sandbox creation
     let task_spec_path = worktree_abs.join(format!("{}.md", task.meta.id));
@@ -680,6 +678,18 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
     // Drop the codegraph guard to stop the watch daemon before committing
     drop(codegraph_guard);
 
+    // Clean up the worktree after the task (removes working tree, keeps branch)
+    if has_git && worktree_path.exists() {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("worktree")
+            .arg("remove")
+            .arg("-f")
+            .arg(&worktree_path)
+            .output();
+    }
+
     // Post-task: commit changes to a task-specific branch
     // This supports the stacked PR pattern: each task commits to its own branch
     // which can later be merged/squashed to main
@@ -706,6 +716,36 @@ async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<Token
 }
 
 /// Create the spec content for a task-specific spec file.
+/// Create a git worktree for the task, or fall back to a plain directory.
+fn ensure_worktree(cwd: &Path, worktree_path: &Path, task_id: &str, has_git: bool) -> Result<()> {
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating worktree parent {}", parent.display()))?;
+    }
+    if has_git && !worktree_path.exists() {
+        let branch = format!("task-{}", task_id);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .arg("worktree")
+            .arg("add")
+            .arg("-B")
+            .arg(&branch)
+            .arg(worktree_path)
+            .output()
+            .with_context(|| format!("git worktree add for task {}", task_id))?;
+        if !output.status.success() {
+            eprintln!("[printer] git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+            std::fs::create_dir_all(worktree_path)
+                .with_context(|| format!("creating worktree directory (fallback) {}", worktree_path.display()))?;
+        }
+    } else {
+        std::fs::create_dir_all(worktree_path)
+            .with_context(|| format!("creating worktree directory {}", worktree_path.display()))?;
+    }
+    Ok(())
+}
+
 fn create_task_spec_content(task: &Task) -> String {
     let mut content = format!("# {}\n\n", task.meta.title);
     if !task.body.is_empty() {
@@ -1220,7 +1260,8 @@ mod tests {
     }
 
     #[test]
-    fn create_task_spec_content_formats_title_and_body() {
+    /// Create a git worktree for the task, or fall back to a plain directory.
+fn create_task_spec_content_formats_title_and_body() {
         use crate::tasks::model::{Status, TaskMeta};
         
         let task = Task {
@@ -1246,7 +1287,8 @@ mod tests {
     }
 
     #[test]
-    fn create_task_spec_content_handles_empty_body() {
+    /// Create a git worktree for the task, or fall back to a plain directory.
+fn create_task_spec_content_handles_empty_body() {
         use crate::tasks::model::{Status, TaskMeta};
         
         let task = Task {
