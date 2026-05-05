@@ -1,44 +1,44 @@
 ---
 name: poolside
-description: Use this skill any time you are running as the Poolside ACP agent inside printer. Briefly explains the runtime contract — you are a long-lived ACP server speaking JSON-RPC over stdio, one printer turn = one `session/prompt`, and you should follow the host repo's existing conventions instead of imposing Poolside defaults.
-version: 0.1.0
+description: Use this skill when you are running as the Poolside ACP agent inside printer (i.e. printer launched the `pool` CLI in `acp` server mode). Covers poolside-specific behavior — auth via `~/.config/poolside/credentials.json`, log/state under `~/.local/state/poolside/`, the `.poolside/` per-project config dir written into cwd — that the generic `acp-runtime` skill doesn't cover. The runtime contract (one turn = one `session/prompt`, session lifetime, cwd handling) lives in `acp-runtime`; install that skill alongside this one.
+version: 0.2.0
 ---
 
 # poolside
 
-You are running as the **Poolside model**, dispatched by `printer` over the
-[Agent Client Protocol](https://agentclientprotocol.com). Printer launched
-the `pool` CLI in ACP server mode and is talking to you via JSON-RPC
-over stdio.
+You are running as the **Poolside model**, dispatched by `printer` over
+the [Agent Client Protocol](https://agentclientprotocol.com). Printer
+launched the `pool` CLI in `acp` server mode and is talking to you via
+JSON-RPC over stdio.
 
-## Runtime contract
+The generic ACP wire contract — one printer turn = one
+`session/prompt`, persistent session, cwd-is-live-filesystem, permission
+RPC discipline — lives in the `acp-runtime` skill. Read that one for
+runtime fundamentals; this skill covers poolside-specific quirks.
 
-- **One printer turn = one `session/prompt` request.** Stream content blocks
-  back via `session/update` notifications as you work; finish the turn by
-  resolving the request with a `stopReason`.
-- **Session lifetime spans the whole printer invocation.** Don't assume a
-  fresh session per turn — printer may issue several `session/prompt`s
-  against the same session id before tearing the server down.
-- **The cwd printer hands you is the live host repo (or its sandbox bind
-  mount).** Edits land directly on the user's filesystem.
+## Auth
 
-## Project conventions over Poolside defaults
+- Credentials are loaded from `~/.config/poolside/credentials.json`.
+  `~/.config/` is read-only inside printer's heyvm sandbox (host bind),
+  so you can read but not write that file from inside the sandbox.
+  Refreshes that need to write should happen on the host before the
+  printer run.
+- `POOLSIDE_API_KEY` is also honored if you'd rather inject the key
+  via environment.
 
-This is somebody else's project, not a Poolside scratchpad. Before
-proposing changes:
+## State and logs
 
-- Read what's already in the repo (`AGENTS.md`, `CLAUDE.md`, `README.md`,
-  the immediate file's neighbors). If the repo already encodes a style or
-  workflow, follow it.
-- Match the surrounding code's patterns — error handling, naming, test
-  style — instead of rewriting things into your preferred shape.
-- Use the build / test commands the repo documents. Don't introduce new
-  tooling unless the spec asks for it.
+- Runtime state and trajectories: `~/.local/state/poolside/`.
+- Per-project config dir: `pool acp` writes `<cwd>/.poolside/` on first
+  use. Inside printer's heyvm sandbox, cwd is `/workspace`, which is
+  RW-bound to the host repo — so the directory persists across runs.
+- ACP debug logs: `~/.local/state/poolside/pool/logs/`. Useful when
+  printer surfaces a transport error and you want to see what poolside
+  actually thought was happening.
 
-## When to surface uncertainty
+## Conventions
 
-If a step requires a decision that isn't pinned down by the spec or repo
-conventions (which API to add, which library to pull in, breaking change
-vs. additive), surface that in your reply rather than picking silently.
-Printer's review pass will catch silent guesses, but flagging them up
-front saves a round-trip.
+Defer to the host repo's conventions over your defaults — the
+`acp-runtime` skill has the full discipline. The short version: read
+`AGENTS.md`/`CLAUDE.md`/`README.md`, match surrounding style, use the
+build/test commands the repo documents.

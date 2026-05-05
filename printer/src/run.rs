@@ -405,6 +405,7 @@ fn acquire_sandbox(args: &RunArgs) -> Result<Option<ActiveSandbox>> {
         cwd,
         Some(spec),
         Some(cfg.sandbox.base_image.clone()),
+        None,
     )?))
 }
 

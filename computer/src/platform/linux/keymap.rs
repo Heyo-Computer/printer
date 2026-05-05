@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use evdev::KeyCode as Key;
 
 /// Map a key name (case-insensitive) to a Linux evdev keycode.
-/// Names follow xdotool/wtype conventions where possible.
+/// Names follow wtype conventions where possible.
 pub fn parse_key(name: &str) -> Result<Key> {
     let n = name.trim().to_ascii_lowercase();
     let k = match n.as_str() {

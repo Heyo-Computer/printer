@@ -201,7 +201,6 @@ impl<'a> AgentInvocation<'a> {
         let mut v: Vec<String> = vec![
             "opencode".into(),
             "run".into(),
-            "--prompt".into(),
             prompt.to_string(),
         ];
         if let Some(id) = session_id {

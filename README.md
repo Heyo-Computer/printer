@@ -40,19 +40,123 @@ npx skills add heyo-computer/printer
 ```
 
 ## Getting Started
-The printer cli has a helpful command to generate an example spec markdown file, graph the project, and setup the task tracking:
+
+### Prerequisites
+
+- **Rust toolchain** — `rustc` and `cargo` (install via [rustup](https://rustup.rs))
+- **An agent CLI** — at least one of:
+  - [OpenCode](https://opencode.ai) — `opencode` on `$PATH`
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) — `claude` on `$PATH`
+
+### 1. Build and install CLIs
+
+```sh
+make install        # builds printer, computer, codegraph in release and installs to ~/.local/bin
 ```
-printer init
 
-# or give it a filename for the spec file:
-printer init feature.md
+Or build individually:
 
-# you now also have new directories:
-ls -la 
-...
-.printer/
-.codegraph/
-...
+```sh
+make install-printer     # just the core orchestrator
+make install-codegraph   # just the tree-sitter code query tool
+make install-computer    # just the Wayland desktop automation tool (Linux)
+```
+
+Verify:
+
+```sh
+printer --help
+codegraph --help
+```
+
+### 2. Install printer plugins
+
+Plugins add lifecycle hooks, skills, sandbox drivers, and agent integrations.
+
+```sh
+# Core plugins (recommended for all users)
+printer add-plugin path:plugins/acp-runtime          # shared ACP runtime skill (required for ACP agents)
+printer add-plugin path:plugins/codegraph            # codegraph lifecycle hooks
+
+# OpenCode ACP agent integration
+printer add-plugin path:plugins/opencode             # launches `opencode acp` for persistent sessions
+printer add-plugin path:plugins/codegraph-opencode   # codegraph agent + /cg-* slash commands for opencode
+
+# Claude Code ACP agent integration (if using Claude)
+# printer add-plugin path:plugins/codegraph-claude
+
+# Optional: sandbox isolation via heyvm
+# printer add-plugin path:plugins/heyvm
+
+# Optional: Wayland desktop automation (Linux)
+# printer add-plugin path:plugins/computer
+```
+
+Verify installed plugins:
+
+```sh
+printer plugins
+```
+
+### 3. Install the opencode CLI (if using OpenCode)
+
+The `opencode` binary must be on your `$PATH`. Install from the official repo:
+
+```sh
+# See https://github.com/sst/opencode for the latest install method
+# Common approaches:
+go install github.com/sst/opencode@latest
+# or via npm:
+npm install -g opencode
+```
+
+Configure your AI provider:
+
+```sh
+opencode auth login    # interactive provider setup
+# or set env vars like ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.
+```
+
+### 4. Set up opencode for a project
+
+After cloning this repo (or any repo with the codegraph-opencode plugin):
+
+```sh
+# Copy the agent definition and slash commands into your project
+mkdir -p .opencode
+cp -r plugins/codegraph-opencode/agent   .opencode/
+cp -r plugins/codegraph-opencode/command .opencode/
+
+# Create or merge the project config
+# If you already have an opencode.json, merge the `instructions` and `tools` blocks
+cp plugins/codegraph-opencode/opencode.json .   # or merge manually
+```
+
+Initialize the codegraph index:
+
+```sh
+codegraph index    # one-time; printer exec auto-spawns a watch daemon
+```
+
+### 5. Initialize a project spec
+
+```sh
+printer init                    # writes ./spec.md
+printer init plans/auth.md      # writes to a specific path
+
+# In an already-initialized project (creates auto-numbered specs):
+printer init feat-new-endpoint  # writes specs/NNN-feat-new-endpoint.md
+```
+
+This creates the `.printer/` task store and `.codegraph/` index directory.
+
+### 6. Run
+
+```sh
+printer exec spec.md             # run + review in one command
+printer exec spec.md --verbose   # with live progress output
+printer exec spec.md --agent opencode            # use opencode one-shot backend
+printer exec spec.md --agent acp:opencode-acp    # use opencode ACP (persistent sessions)
 ```
 
 

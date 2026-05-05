@@ -337,6 +337,11 @@ pub struct ExecArgs {
     #[arg(long, default_value_t = false)]
     pub no_sandbox: bool,
 
+    /// Enable recursive mode: iterate over open tasks in the spec and run
+    /// each one in its own sandbox (requires heyvm plugin).
+    #[arg(long, default_value_t = false)]
+    pub recursive: bool,
+
     /// Path/command to launch the ACP agent server when `--agent acp`.
     #[arg(long)]
     pub acp_bin: Option<String>,

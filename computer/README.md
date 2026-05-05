@@ -117,8 +117,8 @@ computer mouse up   --button left
 
 ## Notes
 
-- On Linux this targets the active Wayland session. If you need X11
-  automation, use `xdotool` instead.
+- On Linux this targets the active Wayland session. For X11 automation,
+  additional tools may be required as Wayland does not expose X11-level access.
 - On macOS coordinates for `mouse move` are absolute points on the chosen
   display in the global coordinate space; `--output` is optional.
 - `screenshot` defaults to the first output if `--output` is omitted.

@@ -63,10 +63,18 @@ pub struct AgentSet {
     agents: Vec<ResolvedAgent>,
 }
 
-/// Names that may not be used by plugin-contributed agents — they would shadow
-/// printer's built-in `--agent claude` / `--agent opencode` choices and make
-/// `--agent <reserved>` ambiguous.
-const RESERVED_AGENT_NAMES: &[&str] = &["claude", "opencode", "acp"];
+/// Names that may not be used by plugin-contributed agents.
+///
+/// "acp" is reserved because it's the namespace prefix in `--agent acp:<name>`;
+/// a plugin named "acp" would parse as the bare ACP form (which expects
+/// `--acp-bin`) and confuse the resolver.
+///
+/// "claude" and "opencode" are reserved because they are the built-in
+/// `--agent` names. While plugin agents only resolve under the `acp:<name>`
+/// prefix (so `--agent acp:opencode` is unambiguous from `--agent opencode`),
+/// reserving them prevents confusion and keeps the natural names available
+/// for the built-in one-shot backends.
+const RESERVED_AGENT_NAMES: &[&str] = &["acp", "claude", "opencode"];
 
 impl AgentSet {
     /// Load `[[agent]]` blocks from every installed plugin. Errors if two
@@ -239,9 +247,19 @@ mod tests {
 
     #[test]
     fn validate_rejects_reserved_name() {
-        let s = aspec("claude", "claude-code-acp");
+        // Only "acp" is reserved (it's the prefix word in `--agent acp:<name>`).
+        let s = aspec("acp", "x");
         let err = validate_agent(&s).unwrap_err();
         assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn validate_allows_built_in_agent_names_for_acp_plugins() {
+        // Plugin agents resolve under the `acp:<name>` prefix, so they
+        // don't shadow the built-in one-shot backends. But the names are
+        // still reserved to prevent confusion.
+        assert!(validate_agent(&aspec("claude", "claude-code-acp")).is_err());
+        assert!(validate_agent(&aspec("opencode", "opencode")).is_err());
     }
 
     #[test]

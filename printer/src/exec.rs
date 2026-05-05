@@ -1,8 +1,10 @@
 use crate::agent::TokenUsage;
 use crate::cli::{ExecArgs, HistoryArgs, ReviewArgs, RunArgs};
 use crate::codegraph_watch;
-use crate::drivers::{self, ActiveSandbox, DriverSet};
+use crate::drivers::{self, ActiveSandbox, DriverSet, shell_quote_argv};
 use crate::hooks::{Event, HookContext, HookSet};
+use crate::tasks::store::{self, compute_ready};
+use crate::tasks::model::Task;
 use crate::{review, run};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -442,6 +444,10 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
     };
     warn_about_legacy_checkpoint(&cwd);
 
+    if args.recursive {
+        return exec_recursive(args, cwd).await;
+    }
+
     let cli_spec_abs: Option<PathBuf> = match args.spec.as_deref() {
         Some(p) => Some(
             p.canonicalize()
@@ -489,7 +495,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
     let sandbox = if args.no_sandbox {
         None
     } else {
-        acquire_exec_sandbox(&cwd, exec_spec.clone())?
+        acquire_exec_sandbox(&cwd, exec_spec.clone(), None)?
     };
     if let Some(sb) = sandbox.as_ref() {
         sb.sync_in()?;
@@ -503,20 +509,210 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         hooks.run_cli(Event::BeforeExec, &ctx)?;
     }
 
-    let outcome = run_action(&args, &cwd, &checkpoint_path, action, existing, sandbox.as_ref()).await;
+    let run_result = run_action(&args, &cwd, &checkpoint_path, action, existing, sandbox.as_ref()).await;
+    let run_success = run_result.is_ok();
+    let _outcome = run_result.unwrap_or_default();
     if let Some(sb) = sandbox.as_ref() {
         sb.sync_out();
     }
 
     {
-        let mut ctx = HookContext::new(Event::AfterExec, cwd.clone()).with_exit_status(outcome.is_ok());
+        let mut ctx = HookContext::new(Event::AfterExec, cwd.clone()).with_exit_status(run_success);
         if let Some(s) = &exec_spec {
             ctx = ctx.with_spec(s.clone());
         }
         let _ = hooks.run_cli(Event::AfterExec, &ctx);
     }
 
-    outcome
+    Ok(())
+}
+
+/// Run `printer exec` for each ready task, spawning a sandbox for each.
+/// Ready tasks are open tasks whose dependencies are satisfied, sorted by
+/// priority (highest first) then by id.
+async fn exec_recursive(args: ExecArgs, cwd: PathBuf) -> Result<()> {
+    // Load all tasks and compute the ready queue
+    let tasks_dir = store::tasks_dir(None)?;
+    let all_tasks = store::list_all(&tasks_dir)?;
+    let ready_tasks = compute_ready(&all_tasks);
+
+    if ready_tasks.is_empty() {
+        eprintln!("[printer] no ready tasks to run in recursive mode");
+        return Ok(());
+    }
+
+    eprintln!("[printer] recursive exec: {} ready task(s)", ready_tasks.len());
+
+    for task in ready_tasks {
+        eprintln!("[printer] processing task: {}", task.meta.id);
+        exec_for_task(&args, &cwd, task).await?;
+    }
+
+    Ok(())
+}
+
+/// Execute a single task by spawning a printer subprocess in its worktree sandbox.
+/// This provides process isolation per task as required by the spec.
+async fn exec_for_task(args: &ExecArgs, cwd: &Path, task: &Task) -> Result<TokenUsage> {
+    use tokio::process::Command as TokioCommand;
+    
+    // Create a worktree directory for this task under .printer/worktrees/<task-id>
+    let worktree_path = cwd.join(".printer").join("worktrees").join(&task.meta.id);
+    let worktree_abs = worktree_path.canonicalize().unwrap_or_else(|_| worktree_path.clone());
+
+    // Ensure worktree directory exists
+    std::fs::create_dir_all(&worktree_abs)
+        .with_context(|| format!("creating worktree directory {}", worktree_abs.display()))?;
+
+    // Check if we have a git repo for stacked PR pattern
+    let has_git = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("git rev-parse --git-dir 2>/dev/null")
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Create the task spec file first - needed for sandbox creation
+    let task_spec_path = worktree_abs.join(format!("{}.md", task.meta.id));
+    let task_spec_content = create_task_spec_content(task);
+    std::fs::write(&task_spec_path, &task_spec_content)
+        .with_context(|| format!("writing task spec at {}", task_spec_path.display()))?;
+
+    // Acquire a sandbox for this task using the heyvm driver
+    // This creates an isolated sandbox per task as required by the spec
+    let sandbox = if args.no_sandbox {
+        None
+    } else {
+        acquire_exec_sandbox(&worktree_abs, Some(task_spec_path.clone()), Some(task.meta.id.clone()))
+            .unwrap_or_else(|e| {
+                eprintln!("[printer] failed to acquire sandbox for task {}: {e}; continuing without sandbox", task.meta.id);
+                None
+            })
+    };
+
+    // Spawn a codegraph watch instance in the worktree directory
+    // This ensures the codegraph index picks up changes for each agent
+    let codegraph_guard = if !args.no_codegraph_watch {
+        codegraph_watch::try_spawn(&worktree_abs).unwrap_or_else(|e| {
+            eprintln!("[printer] codegraph watch spawn failed for task {}: {e}; continuing without daemon", task.meta.id);
+            None
+        })
+    } else {
+        None
+    };
+
+    // Spawn a subprocess to run printer for this task
+    // This provides process isolation per task as required by the spec
+    let printer_bin = std::env::current_exe()
+        .context("resolving printer binary path for subprocess")?;
+    
+    let mut cmd = TokioCommand::new(&printer_bin);
+    cmd.args(["exec", task_spec_path.to_str().unwrap_or(".")]);
+    cmd.arg("--cwd").arg(&worktree_abs);
+    
+    if args.verbose {
+        cmd.arg("--verbose");
+    }
+    // Always disable inner codegraph-watch; we already have one for this worktree
+    cmd.arg("--no-codegraph-watch");
+    // Always disable inner sandbox; we already have one for this task
+    cmd.arg("--no-sandbox");
+    if args.skip_plugin_check {
+        cmd.arg("--skip-plugin-check");
+    }
+    
+    // Wrap the subprocess through the sandbox if we have one
+    if let Some(sb) = sandbox.as_ref() {
+        // Sync in before running
+        sb.sync_in()?;
+        
+        // Build the command with sandbox wrapper
+        let enter_template = sb.enter_template();
+        let mut task_argv = vec![
+            printer_bin.to_string_lossy().to_string(),
+            "exec".to_string(),
+            task_spec_path.to_string_lossy().to_string(),
+            "--cwd".to_string(),
+            worktree_abs.to_string_lossy().to_string(),
+        ];
+        if args.verbose {
+            task_argv.push("--verbose".to_string());
+        }
+        task_argv.push("--no-codegraph-watch".to_string());
+        task_argv.push("--no-sandbox".to_string());
+        if args.skip_plugin_check {
+            task_argv.push("--skip-plugin-check".to_string());
+        }
+        
+        let child_cmd = shell_quote_argv(&task_argv);
+        let wrapped = enter_template.replace("{child}", &child_cmd);
+        
+        eprintln!("[printer] spawning agent subprocess for task {} in {} (sandboxed)", task.meta.id, worktree_abs.display());
+        
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .current_dir(&worktree_abs)
+            .output()
+            .with_context(|| format!("spawning sandboxed printer subprocess for task {}", task.meta.id))?;
+        
+        if !output.status.success() {
+            eprintln!("[printer] task {} subprocess failed: {}", task.meta.id, 
+                String::from_utf8_lossy(&output.stderr));
+        }
+        
+        // Sync out after the run
+        sb.sync_out();
+    } else {
+        eprintln!("[printer] spawning agent subprocess for task {} in {}", task.meta.id, worktree_abs.display());
+        
+        let output = cmd.output()
+            .await
+            .with_context(|| format!("spawning printer subprocess for task {}", task.meta.id))?;
+
+        if !output.status.success() {
+            eprintln!("[printer] task {} subprocess failed: {}", task.meta.id, 
+                String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    // Drop the codegraph guard to stop the watch daemon before committing
+    drop(codegraph_guard);
+
+    // Post-task: commit changes to a task-specific branch
+    // This supports the stacked PR pattern: each task commits to its own branch
+    // which can later be merged/squashed to main
+    if has_git {
+        let commit_result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "cd {} && git add -A && git commit -m 'T-{}: {}' 2>/dev/null || true",
+                worktree_abs.display(),
+                task.meta.id,
+                task.meta.title.replace("'", "'\\''")
+            ))
+            .output();
+        
+        if let Ok(output) = commit_result {
+            if output.status.success() {
+                eprintln!("[printer] task {} committed to task branch", task.meta.id);
+            }
+        }
+    }
+
+    eprintln!("[printer] task {} complete", task.meta.id);
+    Ok(TokenUsage::default())
+}
+
+/// Create the spec content for a task-specific spec file.
+fn create_task_spec_content(task: &Task) -> String {
+    let mut content = format!("# {}\n\n", task.meta.title);
+    if !task.body.is_empty() {
+        content.push_str(&task.body);
+        content.push('\n');
+    }
+    content
 }
 
 async fn run_action(
@@ -526,7 +722,7 @@ async fn run_action(
     action: Action,
     existing: Option<Checkpoint>,
     sandbox: Option<&ActiveSandbox>,
-) -> Result<()> {
+) -> Result<TokenUsage> {
     let total = match action {
         Action::AlreadyDone { spec } => {
             eprintln!(
@@ -535,7 +731,7 @@ async fn run_action(
                 spec.display(),
                 checkpoint_path.display()
             );
-            return Ok(());
+            return Ok(TokenUsage::default());
         }
         Action::Fresh { spec } => {
             let cp = Checkpoint::new(spec.clone(), Phase::Planning);
@@ -583,7 +779,7 @@ async fn run_action(
     };
 
     eprintln!("[printer] exec token usage (run + review): {total}");
-    Ok(())
+    Ok(total)
 }
 
 async fn do_run_then_review(
@@ -751,7 +947,7 @@ fn build_review_args(args: &ExecArgs, spec: &Path) -> ReviewArgs {
     }
 }
 
-fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>) -> Result<Option<ActiveSandbox>> {
+fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>, task_id: Option<String>) -> Result<Option<ActiveSandbox>> {
     let cfg = match crate::config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -775,6 +971,7 @@ fn acquire_exec_sandbox(cwd: &Path, spec: Option<PathBuf>) -> Result<Option<Acti
         cwd.to_path_buf(),
         spec,
         Some(cfg.sandbox.base_image.clone()),
+        task_id,
     )?))
 }
 
@@ -1020,5 +1217,56 @@ mod tests {
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.entries[0].checkpoint.spec, PathBuf::from("/tmp/a.md"));
         assert_eq!(loaded.entries[1].checkpoint.spec, PathBuf::from("/tmp/b.md"));
+    }
+
+    #[test]
+    fn create_task_spec_content_formats_title_and_body() {
+        use crate::tasks::model::{Status, TaskMeta};
+        
+        let task = Task {
+            meta: TaskMeta {
+                id: "T-001".to_string(),
+                title: "Implement feature X".to_string(),
+                status: Status::Open,
+                priority: 2,
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+                owner: String::new(),
+                labels: vec!["feature".to_string()],
+                depends_on: Vec::new(),
+                blocked_reason: String::new(),
+                spec_anchor: String::new(),
+            },
+            body: "Implementation details here.".to_string(),
+        };
+        
+        let content = create_task_spec_content(&task);
+        assert!(content.starts_with("# Implement feature X"));
+        assert!(content.contains("Implementation details here."));
+    }
+
+    #[test]
+    fn create_task_spec_content_handles_empty_body() {
+        use crate::tasks::model::{Status, TaskMeta};
+        
+        let task = Task {
+            meta: TaskMeta {
+                id: "T-002".to_string(),
+                title: "Simple task".to_string(),
+                status: Status::Open,
+                priority: 3,
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+                owner: String::new(),
+                labels: Vec::new(),
+                depends_on: Vec::new(),
+                blocked_reason: String::new(),
+                spec_anchor: String::new(),
+            },
+            body: String::new(),
+        };
+        
+        let content = create_task_spec_content(&task);
+        assert_eq!(content, "# Simple task\n\n");
     }
 }

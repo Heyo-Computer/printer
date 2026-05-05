@@ -227,6 +227,7 @@ pub struct DriverContext {
     pub handle: Option<String>,
     pub base_image: Option<String>,
     pub spec_slug: Option<String>,
+    pub task_id: Option<String>,
 }
 
 impl DriverContext {
@@ -244,6 +245,9 @@ impl DriverContext {
         }
         if let Some(s) = &self.spec_slug {
             m.insert("spec_slug", s.clone());
+        }
+        if let Some(t) = &self.task_id {
+            m.insert("task_id", t.clone());
         }
         m
     }
@@ -356,6 +360,7 @@ impl ActiveSandbox {
         cwd: PathBuf,
         spec: Option<PathBuf>,
         base_image: Option<String>,
+        task_id: Option<String>,
     ) -> Result<Self> {
         let spec_slug = spec.as_deref().map(make_spec_slug);
         let mut ctx = DriverContext {
@@ -364,6 +369,7 @@ impl ActiveSandbox {
             handle: None,
             base_image,
             spec_slug,
+            task_id,
         };
         let create_cmd = interpolate(&driver.spec.create, &ctx.vars());
         eprintln!(
@@ -762,6 +768,7 @@ mod tests {
             handle: Some("vm-1".into()),
             base_image: Some("alpine:3.19".into()),
             spec_slug: Some("foo".into()),
+            task_id: None,
         };
         let s = interpolate(
             "create --base {base_image} --name printer-{spec_slug} on {handle}",

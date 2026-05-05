@@ -1,6 +1,6 @@
 ---
 name: computer
-description: This skill should be used when an agent needs to drive or verify desktop/UI behavior on a Wayland session — during either implementation (exercising a UI/web change you just made: open a URL, click through flows, capture before/after screenshots) or review (confirming the change actually landed). Lists monitors and toplevel windows, captures screenshots, opens URLs in the default browser, and synthesizes keyboard/mouse/scroll input via uinput. Reach for this skill any time the user asks to "use computer", "screenshot the desktop", "list windows on Wayland", "click at coordinates", "type into the focused app", "send a key chord", "open a URL in the browser", or to confirm by visual evidence that a UI change actually works. Native Wayland equivalent of the xdotool skill — use this instead of xdotool when `$XDG_SESSION_TYPE` is `wayland`.
+description: This skill should be used when an agent needs to drive or verify desktop/UI behavior on a Wayland session — during either implementation (exercising a UI/web change you just made: open a URL, click through flows, capture before/after screenshots) or review (confirming the change actually landed). Lists monitors and toplevel windows, captures screenshots, opens URLs in the default browser, and synthesizes keyboard/mouse/scroll input via uinput. Reach for this skill any time the user asks to "use computer", "screenshot the desktop", "list windows on Wayland", "click at coordinates", "type into the focused app", "send a key chord", "open a URL in the browser", or to confirm by visual evidence that a UI change actually works. Native Wayland desktop automation tool — use this when `$XDG_SESSION_TYPE` is `wayland`.
 version: 0.1.0
 ---
 
@@ -46,9 +46,8 @@ change end-to-end before marking the task done:
   app under test. Still avoid touching unrelated windows or destructive
   buttons in apps the user happens to have open.
 
-It is also the right tool any time `xdotool` would be reached for but the
-session is Wayland (`echo $XDG_SESSION_TYPE` → `wayland`) — most modern GNOME
-and KDE installs. xdotool only sees XWayland clients there; `computer` sees
+It is also the right tool for Wayland desktop automation (`echo $XDG_SESSION_TYPE` → `wayland`) — most modern GNOME
+and KDE installs. Wayland-native automation works where X11 tools cannot; `computer` sees
 all native Wayland windows and drives input below the compositor.
 
 ## Do not modify state with this skill during review
@@ -130,8 +129,7 @@ Notes that bite if missed:
   apps; otherwise characters drop.
 - **`key tap`/`chord` keysyms** follow xkbcommon names (`Return`, `Escape`,
   `Tab`, `BackSpace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`,
-  `Page_Up`, `F1`–`F12`, `super`, `alt`, `ctrl`, `shift`). Same vocabulary
-  as `xdotool key`.
+  `Page_Up`, `F1`–`F12`, `super`, `alt`, `ctrl`, `shift`).
 
 ## Composing reliable observations
 
