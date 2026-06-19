@@ -6,6 +6,7 @@ mod config;
 mod drivers;
 mod exec;
 mod hooks;
+mod host;
 mod init;
 mod metrics;
 mod plan;

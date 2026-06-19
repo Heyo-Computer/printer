@@ -7,9 +7,8 @@
 use crate::agent::AgentInvocation;
 use crate::cli::TestArgs;
 use crate::prompts::test_prompt;
-use crate::review::{
-    computer_on_path, detect_base, host_display_available, parse_verdict, Verdict,
-};
+use crate::host::{computer_on_path, host_display_available};
+use crate::review::{detect_base, parse_verdict, Verdict};
 use crate::session::Session;
 use crate::skills;
 use anyhow::{Context, Result};

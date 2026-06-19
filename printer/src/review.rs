@@ -2,8 +2,9 @@ use crate::agent::{AgentInvocation, TokenUsage};
 use crate::cli::ReviewArgs;
 use crate::drivers::{ActiveSandbox, DriverSet};
 use crate::hooks::{Event, HookContext, HookSet};
+use crate::host::{computer_on_path, host_display_available};
 use crate::prompts::review_prompt_with;
-use crate::session::Session;
+use crate::session::{MetricsCtx, Session};
 use crate::skills;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -237,7 +238,17 @@ pub async fn review_with_sandbox(
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,
     };
-    let mut session = Session::new(agent).with_verbose(args.verbose);
+    let metrics_cwd = cwd_ref
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let mut session = Session::new(agent)
+        .with_verbose(args.verbose)
+        .with_metrics_context(MetricsCtx {
+            cwd: metrics_cwd,
+            spec: spec_abs.to_string_lossy().into_owned(),
+            agent: args.agent.to_string(),
+            model: args.model.clone(),
+        });
 
     let spec_arg = spec_abs.to_string_lossy().into_owned();
     let result: Result<String> = async {
@@ -371,34 +382,6 @@ pub(crate) fn ui_surface_changed(cwd: Option<&Path>, base: &str) -> bool {
     paths.iter().any(|p| is_ui_path(p))
 }
 
-/// Mirror the preconditions of the `computer` CLI's
-/// `Connection::connect_to_env()` + `/dev/uinput` open: a real display the
-/// computer tool can drive exists iff a Wayland/X11 session is advertised AND
-/// `/dev/uinput` is present.
-pub(crate) fn host_display_available() -> bool {
-    let has_session = std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || matches!(
-            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
-            Some("wayland") | Some("x11")
-        );
-    has_session && Path::new("/dev/uinput").exists()
-}
-
-/// Is the `computer` CLI on PATH? Scan each PATH entry for an executable named
-/// `computer`. Used to warn when host UI review can't actually click-test
-/// because the tool the review prompt relies on isn't installed.
-/// (If sandboxed UI review were ever pursued, the alternative would be to
-/// build/copy the `computer` bin into the heyvm image — out of scope here.)
-pub(crate) fn computer_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let cand = dir.join("computer");
-        cand.is_file()
-    })
-}
-
 fn acquire_sandbox(args: &ReviewArgs) -> Result<Option<ActiveSandbox>> {
     if args.no_sandbox {
         return Ok(None);
@@ -522,29 +505,6 @@ mod tests {
         assert_eq!(cap_verdict_for_unverified_ui(Unknown, true, false), Unknown);
     }
 
-    #[test]
-    fn computer_on_path_finds_known_bin() {
-        // A dir containing an executable file named `computer` is detected.
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("computer");
-        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        // Empty PATH -> not found.
-        let prev = std::env::var_os("PATH");
-        unsafe { std::env::set_var("PATH", "/nonexistent-printer-test-dir") };
-        assert!(!computer_on_path());
-        // PATH with our temp dir -> found.
-        unsafe { std::env::set_var("PATH", dir.path()) };
-        assert!(computer_on_path());
-        match prev {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-    }
 
     #[test]
     fn ui_path_matches_ts_js_under_frontend_dirs() {

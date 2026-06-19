@@ -8,6 +8,109 @@ use std::path::Path;
 use tokio::process::Command;
 use uuid::Uuid;
 
+/// The read-only codegraph MCP tools, fully qualified as Claude exposes them
+/// (`mcp__<server>__<tool>`). Used to pre-approve the tools via `--allowedTools`
+/// so headless `--print` runs don't auto-deny them under a prompting
+/// permission mode.
+const CODEGRAPH_MCP_TOOLS: &[&str] = &[
+    "mcp__codegraph__search",
+    "mcp__codegraph__definition",
+    "mcp__codegraph__outline",
+    "mcp__codegraph__snippet",
+    "mcp__codegraph__references",
+];
+
+/// The computer (desktop control) MCP tools. Only offered to Claude on a real,
+/// non-sandboxed display — see `mcp_args`.
+const COMPUTER_MCP_TOOLS: &[&str] = &[
+    "mcp__computer__screenshot",
+    "mcp__computer__outputs",
+    "mcp__computer__windows",
+    "mcp__computer__mouse_move",
+    "mcp__computer__mouse_click",
+    "mcp__computer__mouse_scroll",
+    "mcp__computer__mouse_drag",
+    "mcp__computer__key",
+    "mcp__computer__type",
+    "mcp__computer__browse",
+];
+
+/// Build the merged `claude` MCP flags for whichever servers are available.
+/// Each entry is `(server_name, absolute_bin_path, tool_names)`. Emits a SINGLE
+/// `--mcp-config` (one inline JSON object holding every server) and a SINGLE
+/// comma-joined `--allowedTools` — passing those flags once is more robust than
+/// repeating them, and the comma-joined value can't greedily consume the
+/// trailing prompt positional. Empty vec when no servers are available, so
+/// setups without these tools are untouched. Pure (paths passed in) so it's
+/// unit-testable without depending on the host PATH.
+fn mcp_args_for(servers: &[(&str, &Path, &[&str])]) -> Vec<String> {
+    if servers.is_empty() {
+        return Vec::new();
+    }
+    // `serde_json` quotes/escapes each absolute path so the inline JSON is valid
+    // regardless of spaces in the path.
+    let mut map = serde_json::Map::new();
+    let mut tools: Vec<&str> = Vec::new();
+    for (name, bin, server_tools) in servers {
+        map.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "type": "stdio",
+                "command": bin.to_string_lossy(),
+                "args": ["mcp"],
+            }),
+        );
+        tools.extend_from_slice(server_tools);
+    }
+    let config = serde_json::json!({ "mcpServers": map });
+    vec![
+        "--mcp-config".into(),
+        config.to_string(),
+        "--strict-mcp-config".into(),
+        "--allowedTools".into(),
+        tools.join(","),
+    ]
+}
+
+/// Decide which MCP servers to offer given the resolved binaries and host
+/// state. codegraph is offered whenever its binary is installed (it works
+/// headless, including in the sandbox VM). The computer server is offered only
+/// when NOT in the sandbox (the heyvm microVM is headless), a real display is
+/// present, and the binary is installed — so desktop tools never appear where
+/// they can't work. Pure, so the gating is unit-testable.
+fn select_servers<'a>(
+    codegraph: Option<&'a Path>,
+    computer: Option<&'a Path>,
+    display: bool,
+    in_sandbox: bool,
+) -> Vec<(&'a str, &'a Path, &'a [&'a str])> {
+    let mut servers: Vec<(&str, &Path, &[&str])> = Vec::new();
+    if let Some(bin) = codegraph {
+        servers.push(("codegraph", bin, CODEGRAPH_MCP_TOOLS));
+    }
+    if !in_sandbox
+        && display
+        && let Some(bin) = computer
+    {
+        servers.push(("computer", bin, COMPUTER_MCP_TOOLS));
+    }
+    servers
+}
+
+/// Assemble the MCP flags from the live environment (see [`select_servers`]).
+fn mcp_args(in_sandbox: bool) -> Vec<String> {
+    let codegraph = crate::codegraph_watch::locate_binary();
+    let computer = crate::host::locate_computer_binary();
+    let display = crate::host::host_display_available();
+    let servers = select_servers(
+        codegraph.as_deref(),
+        computer.as_deref(),
+        display,
+        in_sandbox,
+    );
+    mcp_args_for(&servers)
+}
+
 /// Per-turn token breakdown, normalized across agents.
 #[derive(Debug, Default, Clone, Copy, Serialize)]
 pub struct TokenUsage {
@@ -211,6 +314,17 @@ impl<'a> AgentInvocation<'a> {
             v.push("--model".into());
             v.push(model.to_string());
         }
+        // Expose codegraph (and, on a real non-sandboxed display, computer) as
+        // native MCP tools so the agent calls them directly instead of treating
+        // the skill nudge as an advisory it can skip in favor of Bash/Read/Grep.
+        // Gated on the binaries being installed so other setups are untouched.
+        // The MCP config is INLINE JSON (not a file path) using absolute binary
+        // paths, so codegraph resolves identically on the host and inside the
+        // sandbox VM (whose read-only $HOME bind exposes the same path); the
+        // computer server is suppressed in the sandbox (headless microVM).
+        // `--strict-mcp-config` keeps the user's own MCP servers out of printer
+        // runs.
+        v.extend(mcp_args(self.command_wrapper.is_some()));
         v.push(prompt.to_string());
         v
     }
@@ -509,6 +623,88 @@ not json at all
         assert_eq!(out.result_text, "hi");
         assert_eq!(out.usage.output_tokens, 2);
         assert!(out.tools.is_empty());
+    }
+
+    // Locate the single value following `flag` in an argv vec.
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let i = args.iter().position(|a| a == flag).unwrap();
+        &args[i + 1]
+    }
+
+    #[test]
+    fn mcp_args_codegraph_only() {
+        let cg = std::path::PathBuf::from("/home/u/.local/bin/codegraph");
+        let args = mcp_args_for(&[("codegraph", &cg, CODEGRAPH_MCP_TOOLS)]);
+        // Flags appear exactly once.
+        assert_eq!(args.iter().filter(|a| *a == "--mcp-config").count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "--allowedTools").count(), 1);
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        let cfg: serde_json::Value =
+            serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
+        assert_eq!(cfg["mcpServers"]["codegraph"]["type"], "stdio");
+        assert!(cfg["mcpServers"].get("computer").is_none());
+        assert_eq!(cfg["mcpServers"]["codegraph"]["command"], "/home/u/.local/bin/codegraph");
+        assert_eq!(cfg["mcpServers"]["codegraph"]["args"][0], "mcp");
+        let allow = arg_after(&args, "--allowedTools");
+        for tool in CODEGRAPH_MCP_TOOLS {
+            assert!(allow.contains(tool), "{allow} missing {tool}");
+        }
+        assert!(!allow.contains(' '), "allowedTools must be one arg: {allow}");
+    }
+
+    #[test]
+    fn mcp_args_merges_both_servers_into_one_config() {
+        let cg = std::path::PathBuf::from("/usr/bin/codegraph");
+        let comp = std::path::PathBuf::from("/usr/bin/computer");
+        let args = mcp_args_for(&[
+            ("codegraph", &cg, CODEGRAPH_MCP_TOOLS),
+            ("computer", &comp, COMPUTER_MCP_TOOLS),
+        ]);
+        // Each flag still appears exactly once with both servers merged in.
+        assert_eq!(args.iter().filter(|a| *a == "--mcp-config").count(), 1);
+        assert_eq!(args.iter().filter(|a| *a == "--allowedTools").count(), 1);
+        let cfg: serde_json::Value =
+            serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
+        assert_eq!(cfg["mcpServers"]["codegraph"]["type"], "stdio");
+        assert_eq!(cfg["mcpServers"]["computer"]["type"], "stdio");
+        let allow = arg_after(&args, "--allowedTools");
+        for tool in CODEGRAPH_MCP_TOOLS.iter().chain(COMPUTER_MCP_TOOLS) {
+            assert!(allow.contains(tool), "{allow} missing {tool}");
+        }
+        assert!(!allow.contains(' '), "allowedTools must be one arg: {allow}");
+    }
+
+    #[test]
+    fn mcp_args_empty_when_no_servers() {
+        assert!(mcp_args_for(&[]).is_empty());
+    }
+
+    #[test]
+    fn select_servers_gates_computer_on_display_and_sandbox() {
+        let cg = std::path::PathBuf::from("/usr/bin/codegraph");
+        let comp = std::path::PathBuf::from("/usr/bin/computer");
+        let names = |v: &[(&str, &Path, &[&str])]| -> Vec<String> {
+            v.iter().map(|(n, _, _)| n.to_string()).collect()
+        };
+
+        // Display + not sandboxed → both servers.
+        let both = select_servers(Some(&cg), Some(&comp), true, false);
+        assert_eq!(names(&both), vec!["codegraph", "computer"]);
+
+        // In the sandbox → computer suppressed even with a display + binary.
+        let sandboxed = select_servers(Some(&cg), Some(&comp), true, true);
+        assert_eq!(names(&sandboxed), vec!["codegraph"]);
+
+        // No display → computer suppressed.
+        let headless = select_servers(Some(&cg), Some(&comp), false, false);
+        assert_eq!(names(&headless), vec!["codegraph"]);
+
+        // Computer binary absent → only codegraph.
+        let no_comp = select_servers(Some(&cg), None, true, false);
+        assert_eq!(names(&no_comp), vec!["codegraph"]);
+
+        // Neither binary → empty.
+        assert!(select_servers(None, None, true, false).is_empty());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::prompts::{
     bootstrap_prompt, fix_from_review_prompt, nudge_prompt_with, planning_prompt, rotation_prompt,
     unstall_prompt, SENTINEL_BLOCKED, SENTINEL_DONE,
 };
-use crate::session::Session;
+use crate::session::{MetricsCtx, Session};
 use crate::skills;
 use crate::tasks::model::{Status, Task};
 use crate::tasks::{spec, store};
@@ -192,7 +192,14 @@ async fn run_inner(
         acp_args: acp.args.as_slice(),
         acp_env: &acp.env,
     };
-    let mut session = Session::new(agent).with_verbose(args.verbose);
+    let mut session = Session::new(agent)
+        .with_verbose(args.verbose)
+        .with_metrics_context(MetricsCtx {
+            cwd: cwd.to_path_buf(),
+            spec: spec_abs.to_string_lossy().into_owned(),
+            agent: args.agent.to_string(),
+            model: args.model.clone(),
+        });
 
     // Initial sync: parse spec and reconcile with the task store.
     let report = sync_spec(spec_abs, tasks_dir)?;

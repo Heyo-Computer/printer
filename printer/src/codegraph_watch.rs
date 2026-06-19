@@ -193,7 +193,11 @@ fn spawn_one(bin: &Path, cwd: &Path, log_path: &Path) -> Result<Child> {
         .map_err(|e| anyhow::anyhow!("failed to spawn `{} watch`: {e}", bin.display()))
 }
 
-fn locate_binary() -> Option<PathBuf> {
+/// Resolve the `codegraph` binary: PATH first, then the bundled plugin bin
+/// dir under `~/.printer`. Shared by the watch daemon and the Claude MCP
+/// wiring (`agent::claude_argv`), which needs an absolute command that
+/// resolves identically on the host and inside a sandbox VM.
+pub fn locate_binary() -> Option<PathBuf> {
     if let Ok(p) = which("codegraph") {
         return Some(p);
     }

@@ -25,9 +25,21 @@ pub struct Session<'a> {
     pub usage_total: TokenUsage,
     pub agent: AgentInvocation<'a>,
     pub verbose: bool,
+    /// When set, each turn whose tool activity is observable appends a `turn`
+    /// record to `.printer/metrics.jsonl` with the codegraph search-tool
+    /// histogram. Left `None` for phases (test/exec-total) that don't track it.
+    metrics_ctx: Option<MetricsCtx>,
     fresh: bool,
     acp: Option<AcpClient>,
     acp_session_id: Option<String>,
+}
+
+/// Attribution for per-turn metrics rows written by `Session`.
+pub struct MetricsCtx {
+    pub cwd: std::path::PathBuf,
+    pub spec: String,
+    pub agent: String,
+    pub model: Option<String>,
 }
 
 impl<'a> Session<'a> {
@@ -39,6 +51,7 @@ impl<'a> Session<'a> {
             usage_total: TokenUsage::default(),
             agent,
             verbose: false,
+            metrics_ctx: None,
             fresh: true,
             acp: None,
             acp_session_id: None,
@@ -47,6 +60,13 @@ impl<'a> Session<'a> {
 
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// Enable per-turn metrics rows (codegraph search-tool histogram) attributed
+    /// to `ctx`. No-op for turns with no observable tool activity.
+    pub fn with_metrics_context(mut self, ctx: MetricsCtx) -> Self {
+        self.metrics_ctx = Some(ctx);
         self
     }
 
@@ -213,8 +233,12 @@ impl<'a> Session<'a> {
             outcome.usage,
             self.usage_total,
         );
-        // Surface per-tool activity when running verbose (claude stream-json
-        // populates `outcome.tools`; other backends leave it empty).
+        // Search-tool histogram for the codegraph guardrail + metrics. Tool
+        // activity is only observable on verbose (stream-json) claude turns;
+        // other backends leave `tools` empty so both counts are 0.
+        let raw_search = count_inefficient_search_tools(&outcome.tools);
+        let codegraph = count_codegraph_search_tools(&outcome.tools);
+        // Surface per-tool activity when running verbose.
         if self.verbose && !outcome.tools.is_empty() {
             for t in &outcome.tools {
                 if t.input_summary.is_empty() {
@@ -224,13 +248,34 @@ impl<'a> Session<'a> {
                 }
             }
             eprintln!("[printer] tools: {}", format_tool_summary(&outcome.tools));
-            let inefficient = count_inefficient_search_tools(&outcome.tools);
-            if inefficient > 0 {
+            if raw_search > 0 && codegraph == 0 {
+                // The agent did raw search and never touched codegraph — the
+                // regression the codegraph wiring exists to prevent. Escalate.
                 eprintln!(
-                    "[printer] hint: {inefficient} raw grep/find/cat call(s) this turn — \
+                    "[printer] ⚠ {raw_search} raw search call(s), 0 codegraph this turn — \
+                     agent bypassed codegraph (mcp__codegraph__* / search / definition / references)."
+                );
+            } else if raw_search > 0 {
+                eprintln!(
+                    "[printer] hint: {raw_search} raw grep/find/cat call(s) this turn — \
                      prefer `codegraph` (search/definition/references) for token-efficient search."
                 );
             }
+        }
+        // Per-turn metrics row when attribution is configured and there was
+        // observable tool activity (verbose claude turns only).
+        if let Some(ctx) = &self.metrics_ctx
+            && !outcome.tools.is_empty()
+        {
+            crate::metrics::record_turn(
+                &ctx.cwd,
+                &ctx.spec,
+                ctx.agent.clone(),
+                ctx.model.clone(),
+                outcome.usage,
+                raw_search as u64,
+                codegraph as u64,
+            );
         }
         // Subsequent turns resume the same session id (claude requires a new
         // uuid for --session-id, so we keep using --resume from now on).
@@ -568,6 +613,21 @@ fn count_inefficient_search_tools(tools: &[ToolUseEvent]) -> usize {
         .count()
 }
 
+/// Count codegraph tool calls: the native MCP tools (`mcp__codegraph__*`) and
+/// `Bash` invocations whose leading program is `codegraph`. Paired with
+/// `count_inefficient_search_tools` to detect a turn that searched the raw way
+/// and never used codegraph (the guardrail warning).
+fn count_codegraph_search_tools(tools: &[ToolUseEvent]) -> usize {
+    tools
+        .iter()
+        .filter(|t| {
+            t.name.starts_with("mcp__codegraph__")
+                || (t.name == "Bash"
+                    && t.input_summary.split_whitespace().next() == Some("codegraph"))
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +677,35 @@ mod tests {
         ];
         assert_eq!(count_inefficient_search_tools(&tools), 4);
         assert_eq!(count_inefficient_search_tools(&[]), 0);
+    }
+
+    #[test]
+    fn counts_codegraph_tools_native_and_bash() {
+        let tools = vec![
+            ev("mcp__codegraph__search"),           // native MCP tool
+            ev("mcp__codegraph__definition"),       // native MCP tool
+            ev_cmd("Bash", "codegraph outline x.rs"), // codegraph via Bash
+            ev_cmd("Bash", "grep -rn foo"),          // raw — not codegraph
+            ev("Grep"),                              // raw — not codegraph
+            ev("Read"),                              // unrelated
+        ];
+        assert_eq!(count_codegraph_search_tools(&tools), 3);
+        assert_eq!(count_codegraph_search_tools(&[]), 0);
+    }
+
+    #[test]
+    fn guardrail_distinguishes_bypass_from_mixed_use() {
+        // Raw search with zero codegraph → the escalation condition.
+        let bypassed = vec![ev("Grep"), ev_cmd("Bash", "find . -name '*.rs'")];
+        assert!(
+            count_inefficient_search_tools(&bypassed) > 0
+                && count_codegraph_search_tools(&bypassed) == 0
+        );
+        // Raw search alongside codegraph → only the soft hint, no escalation.
+        let mixed = vec![ev("Grep"), ev("mcp__codegraph__search")];
+        assert!(
+            count_inefficient_search_tools(&mixed) > 0
+                && count_codegraph_search_tools(&mixed) > 0
+        );
     }
 }
